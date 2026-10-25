@@ -2,9 +2,6 @@
 
 start: js_script_module
 
-// A JS file may contain any number of top-level items. Without the '+' the grammar
-// accepts exactly one, so `function a(){} function b(){}`, a call after a function, or
-// any trailing text is rejected with "Expected $END".
 js_script_module: top_level+
 
 top_level: statement

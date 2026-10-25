@@ -74,13 +74,17 @@ separately as `attribution_wall_s`.
   - `run_llm.py` adds a `max_new_tokens` cap.
 - **The JS grammars, the JS pruner (`javascript_chopchop.py`), and the three generator wrappers**:
   these come from the original project (CindyZhou2003/constrained-llm-js-codegen). Changes here:
-  - `javascript.lark` accepts more than one top-level item (`top_level+`).
+  - `javascript.lark` accepts more than one top-level item (`top_level+`). Otherwise it is
+    byte-identical to the original, so the grammar hash (8626154403), and with it the cached
+    IterGen mask stores, stay the same.
   - `semantic_checks.py` is the IterGen checks, moved out of the generator. Two rules were fixed:
     - `orphan_break` never fired.
     - `const_reassign` missed `++`/`--`.
   - `kv_cache.py` provides a rewindable KV cache, used by both tools, for transformers 5.x and
     hybrid models.
-  - The ChopChop wrapper uses the CPU-time limit and rejection attribution described above.
+  - The ChopChop wrapper uses the CPU-time limit and rejection attribution described above. Its
+    chat template is rendered with `enable_thinking=False`, because Qwen3.5's template
+    otherwise opens a `<think>` block. Qwen2.5's template is unaffected.
     - The JS pruner gained per-rule switches for the attribution. With all rules on, which is
       always the case outside attribution, its decisions are unchanged.
     - The pruner's known false rejections were deliberately **not** fixed: parenthesised arrow

@@ -211,6 +211,10 @@ class _LocalLanguageModelRunner(LanguageModelRunner):
                 add_special_tokens=False,
                 return_tensors="pt",
                 padding=True,
+                # Qwen3.5's template opens a <think> block by default, and the code would be
+                # seeded inside it. This closes it (empty thinking). Templates without the
+                # switch ignore it -- Qwen2.5's renders byte-identically either way.
+                enable_thinking=False,
             )
             # Newer transformers return a BatchEncoding here (apply_chat_template's
             # return_dict now defaults to True); older ones returned a bare tensor.
