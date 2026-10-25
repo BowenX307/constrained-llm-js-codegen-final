@@ -1,0 +1,407 @@
+# ChopChop-compatible JavaScript grammar
+#
+# Covers: arrow functions, async/await, classes, template & regex literals,
+# spread/rest, default parameters, destructuring declarations, nullish
+# coalescing, import/export, yield/generators, delete, optional chaining, etc.
+
+IDENTIFIER: /(?!(let|const|var|return|true|false|null|undefined|function|if|else|for|while|do|break|continue|throw|try|catch|finally|new|typeof|void|instanceof|in|of|switch|case|default|class|extends|super|import|export|from|as|async|await|yield|delete|static)$)[A-Za-z_$][A-Za-z0-9_$]*/
+NUMBER: /(?:0[xX][0-9a-fA-F]+n?|0[oO][0-7]+n?|0[bB][01]+n?|(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?n?)/
+STRING: /'([^'\\]|\\.)*'|"([^"\\]|\\.)*"/
+TEMPLATE_LITERAL: /`([^`\\]*(\\.[^`\\]*)*)`/
+REGEX_LITERAL: /\/([^\s\d\\\/\[]|\\.|\[([^\]\n\\]|\\.)*\])([^\s\\\/\[]|\\.|\[([^\]\n\\]|\\.)*\])*\/[gimsuy]*/
+LINE_COMMENT: /\/\/[^\n\r]*/
+BLOCK_COMMENT: /\/\*[\s\S]*?\*\//
+WS: /\s+/
+
+%ignore WS
+%ignore LINE_COMMENT
+%ignore BLOCK_COMMENT
+
+start: stmt_seq
+
+stmt_seq: stmt
+        | stmt stmt_seq {StmtSeq}
+
+# ------------------------------------------------------------------
+# Statements
+# ------------------------------------------------------------------
+
+stmt: declaration_statement
+    | expression_statement
+    | if_statement
+    | while_statement
+    | do_while_statement
+    | for_statement
+    | for_in_statement
+    | for_of_statement
+    | switch_statement
+    | control_flow_statement
+    | try_catch_statement
+    | with_statement
+    | compound_statement
+    | function_declaration
+    | class_declaration
+    | import_statement
+    | export_statement
+
+expression_statement: expression ";" {ExprStmt}
+                    | expression {ExprStmt}
+
+# --- Functions (sync & async, regular & generator) -----------------
+
+function_declaration: "function" IDENTIFIER function_params_postfix compound_statement {FunctionDecl}
+                    | "async" "function" IDENTIFIER function_params_postfix compound_statement {AsyncFunctionDecl}
+                    | "function" "*" IDENTIFIER function_params_postfix compound_statement {GeneratorDecl}
+                    | "async" "function" "*" IDENTIFIER function_params_postfix compound_statement {AsyncGeneratorDecl}
+
+# --- Classes -------------------------------------------------------
+
+class_declaration: "class" IDENTIFIER class_body {ClassDecl}
+                 | "class" IDENTIFIER "extends" expression class_body {ClassDeclExtends}
+
+class_body: "{" "}" {EmptyClassBody}
+          | "{" class_members "}" {ClassBody}
+
+class_members: class_member
+             | class_member class_members {ClassMembers}
+
+class_member: IDENTIFIER function_params_postfix compound_statement {ClassMethod}
+            | "static" IDENTIFIER function_params_postfix compound_statement {StaticMethod}
+            | "async" IDENTIFIER function_params_postfix compound_statement {AsyncClassMethod}
+            | IDENTIFIER "=" expression ";" {ClassField}
+            | IDENTIFIER "=" expression {ClassField}
+            | "static" IDENTIFIER "=" expression ";" {StaticField}
+            | "static" IDENTIFIER "=" expression {StaticField}
+
+# --- Import / Export -----------------------------------------------
+
+import_statement: "import" STRING ";" {ImportBare}
+               | "import" STRING {ImportBare}
+               | "import" IDENTIFIER "from" STRING ";" {ImportDefault}
+               | "import" IDENTIFIER "from" STRING {ImportDefault}
+               | "import" "{" import_specifiers "}" "from" STRING ";" {ImportNamed}
+               | "import" "{" import_specifiers "}" "from" STRING {ImportNamed}
+               | "import" IDENTIFIER "," "{" import_specifiers "}" "from" STRING ";" {ImportDefaultNamed}
+               | "import" IDENTIFIER "," "{" import_specifiers "}" "from" STRING {ImportDefaultNamed}
+
+import_specifiers: import_specifier
+                 | import_specifier "," import_specifiers {ImportSpecSeq}
+
+import_specifier: IDENTIFIER {ImportSpec}
+                | IDENTIFIER "as" IDENTIFIER {ImportAlias}
+
+export_statement: "export" "default" expression ";" {ExportDefaultExpr}
+                | "export" "default" expression {ExportDefaultExpr}
+                | "export" declaration_statement {ExportDecl}
+                | "export" function_declaration {ExportFuncDecl}
+                | "export" class_declaration {ExportClassDecl}
+                | "export" "{" export_specifiers "}" ";" {ExportNamed}
+                | "export" "{" export_specifiers "}" {ExportNamed}
+                | "export" "{" export_specifiers "}" "from" STRING ";" {ExportNamedFrom}
+                | "export" "{" export_specifiers "}" "from" STRING {ExportNamedFrom}
+
+export_specifiers: export_specifier
+                 | export_specifier "," export_specifiers {ExportSpecSeq}
+
+export_specifier: IDENTIFIER {ExportSpec}
+                | IDENTIFIER "as" IDENTIFIER {ExportAlias}
+
+# --- Blocks & Control Flow -----------------------------------------
+
+compound_statement: "{" "}" {EmptyBlock}
+                  | "{" stmt_seq "}" {NonemptyBlock}
+
+if_statement: "if" "(" expression ")" stmt {IfThen}
+            | "if" "(" expression ")" stmt "else" stmt {IfThenElse}
+
+while_statement: "while" "(" expression ")" stmt {WhileStmt}
+
+do_while_statement: "do" stmt "while" "(" expression ")" ";" {DoWhileStmt}
+                  | "do" stmt "while" "(" expression ")" {DoWhileStmt}
+
+with_statement: "with" "(" expression ")" stmt {WithStmt}
+
+for_statement: "for" "(" for_init ";" expression ";" expression ")" stmt {ForStmt}
+
+for_init: "let" lvalue "=" expression {ForInitLet}
+        | "const" lvalue "=" expression {ForInitConst}
+        | "var" lvalue "=" expression {ForInitVar}
+        | "let" lvalue {ForInitLetNoInit}
+        | "const" lvalue {ForInitConstNoInit}
+        | "var" lvalue {ForInitVarNoInit}
+        | lvalue "=" expression {ForInitAssign}
+        | expression {ForInitExpr}
+
+for_in_statement: "for" "(" "let" IDENTIFIER "in" expression ")" stmt {ForInLetStmt}
+                | "for" "(" "const" IDENTIFIER "in" expression ")" stmt {ForInConstStmt}
+                | "for" "(" "var" IDENTIFIER "in" expression ")" stmt {ForInVarStmt}
+
+for_of_statement: "for" "(" "let" IDENTIFIER "of" expression ")" stmt {ForOfLetStmt}
+                | "for" "(" "const" IDENTIFIER "of" expression ")" stmt {ForOfConstStmt}
+                | "for" "(" "var" IDENTIFIER "of" expression ")" stmt {ForOfVarStmt}
+
+switch_statement: "switch" "(" expression ")" "{" "}" {EmptySwitch}
+                | "switch" "(" expression ")" "{" case_clauses "}" {SwitchStmt}
+                | "switch" "(" expression ")" "{" case_clauses default_clause "}" {SwitchStmtDefault}
+                | "switch" "(" expression ")" "{" default_clause "}" {SwitchStmtDefaultOnly}
+
+case_clauses: case_clause
+            | case_clause case_clauses {CaseClauses}
+
+case_clause: "case" expression ":" {EmptyCase}
+           | "case" expression ":" stmt_seq {CaseClause}
+
+default_clause: "default" ":" {EmptyDefault}
+              | "default" ":" stmt_seq {DefaultClause}
+
+control_flow_statement: "break" ";" {BreakStmt}
+                      | "break" {BreakStmt}
+                      | "continue" ";" {ContinueStmt}
+                      | "continue" {ContinueStmt}
+                      | "return" expression ";" {ReturnStmt}
+                      | "return" expression {ReturnStmt}
+                      | "return" ";" {ReturnVoidStmt}
+                      | "return" {ReturnVoidStmt}
+                      | "throw" expression ";" {ThrowStmt}
+                      | "throw" expression {ThrowStmt}
+
+try_catch_statement: "try" compound_statement "catch" "(" IDENTIFIER ")" compound_statement {TryCatch}
+                   | "try" compound_statement "catch" compound_statement {TryCatchNoParam}
+                   | "try" compound_statement "catch" "(" IDENTIFIER ")" compound_statement "finally" compound_statement {TryCatchFinally}
+                   | "try" compound_statement "catch" compound_statement "finally" compound_statement {TryCatchNoParamFinally}
+                   | "try" compound_statement "finally" compound_statement {TryFinally}
+
+declaration_statement: "let" lvalue "=" expression ";" {LetDecl}
+                     | "let" lvalue "=" expression {LetDecl}
+                     | "let" lvalue ";" {LetDeclNoInit}
+                     | "let" lvalue {LetDeclNoInit}
+                     | "const" lvalue "=" expression ";" {ConstDecl}
+                     | "const" lvalue "=" expression {ConstDecl}
+                     | "const" lvalue ";" {ConstDeclNoInit}
+                     | "const" lvalue {ConstDeclNoInit}
+                     | "var" lvalue "=" expression ";" {VarDecl}
+                     | "var" lvalue "=" expression {VarDecl}
+                     | "var" lvalue ";" {VarDeclNoInit}
+                     | "var" lvalue {VarDeclNoInit}
+
+lvalue: member_expression
+
+# ------------------------------------------------------------------
+# Expressions
+# ------------------------------------------------------------------
+
+expression: assignment_expr
+
+ASSIGN_OP: />>>=|>>=|<<=|&&=|\|\|=|\?\?=|\*\*=|[+\-*\/%&|^]?=/
+
+assignment_expr: lvalue ASSIGN_OP assignment_expr {AssignExpr}
+               | ternary_expr
+
+ternary_expr: logic_expr
+            | logic_expr "?" expression ":" expression {TernaryExpr}
+
+logic_expr: bitwise_or_expr
+          | logic_expr "||" bitwise_or_expr {LogicOr}
+          | logic_expr "&&" bitwise_or_expr {LogicAnd}
+          | logic_expr "??" bitwise_or_expr {NullishCoalesce}
+
+bitwise_or_expr: bitwise_xor_expr
+               | bitwise_or_expr "|" bitwise_xor_expr {BitwiseOr}
+
+bitwise_xor_expr: bitwise_and_expr
+                | bitwise_xor_expr "^" bitwise_and_expr {BitwiseXor}
+
+bitwise_and_expr: equality_expr
+                | bitwise_and_expr "&" equality_expr {BitwiseAnd}
+
+equality_expr: relational_expr
+             | equality_expr "==" relational_expr {Eq}
+             | equality_expr "!=" relational_expr {Neq}
+             | equality_expr "===" relational_expr {StrictEq}
+             | equality_expr "!==" relational_expr {StrictNeq}
+
+relational_expr: shift_expr
+               | relational_expr "<" shift_expr {Lt}
+               | relational_expr "<=" shift_expr {Lte}
+               | relational_expr ">" shift_expr {Gt}
+               | relational_expr ">=" shift_expr {Gte}
+               | relational_expr "instanceof" shift_expr {InstanceOf}
+               | relational_expr "in" shift_expr {InExpr}
+
+shift_expr: sum_expr
+          | shift_expr "<<" sum_expr {LShift}
+          | shift_expr ">>" sum_expr {RShift}
+          | shift_expr ">>>" sum_expr {URShift}
+
+sum_expr: product_expr
+        | sum_expr "+" product_expr {Add}
+        | sum_expr "-" product_expr {Sub}
+
+product_expr: exp_expr
+            | product_expr "*" exp_expr {Mul}
+            | product_expr "/" exp_expr {Div}
+            | product_expr "%" exp_expr {Mod}
+
+exp_expr: unary_expr
+        | unary_expr "**" exp_expr {Power}
+
+unary_expr: member_expression
+          | "-" unary_expr {Neg}
+          | "+" unary_expr {UnaryPlus}
+          | "!" unary_expr {Not}
+          | "~" unary_expr {BitwiseNot}
+          | "typeof" unary_expr {TypeofExpr}
+          | "void" unary_expr {VoidExpr}
+          | "delete" unary_expr {DeleteExpr}
+          | "await" unary_expr {AwaitExpr}
+          | "yield" unary_expr {YieldExpr}
+          | "yield" "*" unary_expr {YieldStarExpr}
+          | "++" unary_expr {PreInc}
+          | "--" unary_expr {PreDec}
+
+member_expression: primary_expr
+                 | member_expression "." member_name {MemberAccess}
+                 | member_expression "?." member_name {OptionalChain}
+                 | member_expression "[" expression "]" {IndexAccess}
+                 | member_expression "?." "[" expression "]" {OptionalIndexAccess}
+                 | member_expression "(" ")" {Call0}
+                 | member_expression "(" arg_list ")" {CallN}
+                 | member_expression "?." "(" ")" {OptionalCall0}
+                 | member_expression "?." "(" arg_list ")" {OptionalCallN}
+                 | member_expression "++" {PostInc}
+                 | member_expression "--" {PostDec}
+
+member_name: IDENTIFIER
+           | reserved_word
+
+reserved_word: "async"
+             | "function"
+             | "class"
+             | "var"
+             | "let"
+             | "const"
+             | "if"
+             | "else"
+             | "for"
+             | "while"
+             | "do"
+             | "switch"
+             | "case"
+             | "default"
+             | "try"
+             | "catch"
+             | "finally"
+             | "throw"
+             | "return"
+             | "break"
+             | "continue"
+             | "with"
+             | "this"
+             | "new"
+             | "null"
+             | "undefined"
+             | "true"
+             | "false"
+             | "delete"
+             | "typeof"
+             | "void"
+             | "await"
+             | "in"
+             | "instanceof"
+             | "of"
+             | "as"
+             | "from"
+             | "extends"
+             | "static"
+
+arg_list: arg_item
+        | arg_item "," arg_list {Args}
+
+arg_item: expression
+        | "..." expression {SpreadArg}
+
+# --- Primary Expressions -------------------------------------------
+
+primary_expr: IDENTIFIER {Var}
+            | NUMBER {Num}
+            | STRING {Str}
+            | TEMPLATE_LITERAL {TemplateLit}
+            | REGEX_LITERAL {RegexLit}
+            | "true" {TrueLit}
+            | "false" {FalseLit}
+            | "null" {NullLit}
+            | "undefined" {UndefinedLit}
+            | "this" {ThisLit}
+            | "super" {SuperExpr}
+            | array_literal
+            | object_literal
+            | "(" expression ")" {Group}
+            | "new" member_expression {NewExpr}
+            | function_expression
+            | class_expression
+            | arrow_expression
+
+# --- Arrays --------------------------------------------------------
+
+array_literal: "[" "]" {EmptyArray}
+             | "[" array_items "]" {ArrayLit}
+
+array_items: array_item
+           | array_item "," array_items {ArrayItemSeq}
+
+array_item: expression
+          | "..." expression {SpreadElement}
+
+# --- Objects -------------------------------------------------------
+
+object_literal: "{" "}" {EmptyObject}
+              | "{" property_list "}" {ObjectLit}
+
+property_list: property
+             | property "," property_list {PropertySeq}
+
+property: IDENTIFIER ":" expression {PropertyPair}
+        | STRING ":" expression {PropertyStrPair}
+        | "[" expression "]" ":" expression {ComputedPropertyPair}
+        | IDENTIFIER {ShorthandProperty}
+        | "..." expression {SpreadProperty}
+        | IDENTIFIER function_params_postfix compound_statement {MethodProperty}
+        | "async" IDENTIFIER function_params_postfix compound_statement {AsyncMethodProperty}
+
+# --- Function & Class Expressions -----------------------------------
+
+function_expression: "function" function_params_postfix compound_statement {FunctionExpr}
+                   | "async" "function" function_params_postfix compound_statement {AsyncFunctionExpr}
+                   | "function" "*" function_params_postfix compound_statement {GeneratorExpr}
+                   | "async" "function" "*" function_params_postfix compound_statement {AsyncGeneratorExpr}
+
+class_expression: "class" class_body {ClassExpr}
+                | "class" "extends" expression class_body {ClassExprExtends}
+
+# --- Arrow Expressions ----------------------------------------------
+
+arrow_expression: IDENTIFIER "=>" arrow_body {ArrowExprIdent}
+                | "(" ")" "=>" arrow_body {ArrowExprNoParams}
+                | "(" param_list ")" "=>" arrow_body {ArrowExprParams}
+                | "async" IDENTIFIER "=>" arrow_body {AsyncArrowIdent}
+                | "async" "(" ")" "=>" arrow_body {AsyncArrowNoParams}
+                | "async" "(" param_list ")" "=>" arrow_body {AsyncArrowParams}
+
+arrow_body: compound_statement
+          | assignment_expr
+
+# --- Parameters -----------------------------------------------------
+
+function_params_postfix: "(" ")" {NoParams}
+                       | "(" param_list ")" {Params}
+
+param_list: param_item {Param}
+          | param_item "," param_list {ParamSeq}
+
+param_item: IDENTIFIER
+          | IDENTIFIER "=" expression {DefaultParam}
+          | "..." IDENTIFIER {RestParam}
+          | object_literal
+          | array_literal
+          | object_literal "=" expression {DefaultParam}
+          | array_literal "=" expression {DefaultParam}

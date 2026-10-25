@@ -1,0 +1,16 @@
+# torch comes with the Colab runtime (CUDA build); install it yourself elsewhere.
+transformers==5.20.1
+# IterGen needs syncode's itergen parser, which is on GitHub (not the PyPI release). Pinned:
+# the cached grammar mask store is a pickle of syncode objects. Install it with --no-deps so
+# it cannot replace torch / transformers.
+syncode @ git+https://github.com/structuredllm/syncode.git@4d6c110a028d3fb9cbb5f1a6ac6446b696f3eac4
+fire
+interegular
+tqdm
+datasets
+jsonschema
+# ChopChop
+lark
+regex
+networkx
+psutil
