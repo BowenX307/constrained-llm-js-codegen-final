@@ -9,13 +9,17 @@ def code(s): cells.append(dict(cell_type='code', metadata={}, execution_count=No
 md(r"""
 # Final experiments: one model, one mode per run
 
-**Runtime: L4 GPU** (Runtime > Change runtime type). Then:
+**Runtime: G4 GPU** (NVIDIA RTX PRO 6000; Runtime > Change runtime type). Then:
 
 1. Set `MODEL` and `MODE` in section 1.
 2. **Runtime > Run all**.
 
 Notes:
+- Every final run uses the same runtime type. For ChopChop this matters for the outputs, not
+  only the times: its limit is in CPU seconds, so a faster CPU checks more tokens within it.
 - `N_TASKS = 20` is a smoke test. Set it to `None` and Run all again for all 397 tasks; the 20 finished tasks are kept.
+- ChopChop pilot: `SAMPLE = 60`, `CHECK_CPU_LIMIT = 3600`. Section 5 then shows how the results
+  depend on the limit (tools/limit_curve.py), which is how the final limit is chosen.
 - Outputs are copied to Google Drive as they finish. After a disconnect, Run all again to continue.
 - The code is pinned to one commit of
   [constrained-llm-js-codegen-final](https://github.com/BowenX307/constrained-llm-js-codegen-final),
@@ -25,7 +29,7 @@ Notes:
 |---|---|---|
 | `unconstrained` | 1 | none |
 | `itergen_off`, `itergen_on` | 1: IterGen's 60 s per-task limit is wall-clock, so parallel runs would change outputs | 60 s wall |
-| `chopchop` | as many as fit: its limit is check CPU time, so outputs do not depend on the worker count | 1800 s of check CPU time |
+| `chopchop` | as many as fit: its limit is check CPU time, so outputs do not depend on the worker count | `CHECK_CPU_LIMIT` s of check CPU time |
 """)
 
 md("## 1. Settings")
@@ -33,9 +37,11 @@ code(rf"""
 MODEL      = 'Qwen/Qwen2.5-3B-Instruct'   # or 'Qwen/Qwen3.5-4B'
 MODE       = 'unconstrained'              # unconstrained | itergen_off | itergen_on | chopchop
 N_TASKS    = 20                           # 20 = smoke test; None = all 397
+SAMPLE     = None                         # chopchop pilot: 60 = 60 tasks drawn at random (same for both models)
+SEED       = 0
 N_WORKERS  = 'auto'                       # 'auto': 1, or for chopchop as many as fit
-CHECK_CPU_LIMIT = 1800                    # chopchop: per-task check CPU seconds
-EXPECT_GPU = 'L4'                         # every final run uses the same GPU type
+CHECK_CPU_LIMIT = 1800                    # chopchop: per-task check CPU seconds (pilot: 3600)
+EXPECT_GPU = 'RTX PRO 6000'               # G4; every final run uses the same GPU type
 REPO_URL    = 'https://github.com/BowenX307/constrained-llm-js-codegen-final.git'
 REPO_COMMIT = '{COMMIT}'
 """)
@@ -50,16 +56,18 @@ REPO   = '/content/final'
 CACHE  = '/content/cache'
 WORK   = '/content/work'
 SLUG   = MODEL.split('/')[-1]
-OUT    = f'{WORK}/{SLUG}/{MODE}_{REPO_COMMIT[:7]}'
+RUN    = (MODE + (f'_lim{CHECK_CPU_LIMIT:g}' if MODE == 'chopchop' else '')
+          + (f'_sample{SAMPLE}seed{SEED}' if SAMPLE else '') + '_' + REPO_COMMIT[:7])
+OUT    = f'{WORK}/{SLUG}/{RUN}'
 DRIVE_ROOT = '/content/drive/MyDrive/constrained-llm-js-codegen'     # same folder as the earlier runs
-DRIVE_OUT  = f'{DRIVE_ROOT}/final/{SLUG}/{MODE}_{REPO_COMMIT[:7]}'
+DRIVE_OUT  = f'{DRIVE_ROOT}/final/{SLUG}/{RUN}'
 MS_DRIVE   = f'{DRIVE_ROOT}/mask_store_zst'                          # compressed mask stores, reused
 os.makedirs(OUT, exist_ok=True); os.makedirs(CACHE, exist_ok=True)
 
 smi = subprocess.run(['nvidia-smi', '--query-gpu=name,memory.total', '--format=csv,noheader,nounits'],
                      capture_output=True, text=True)
 if smi.returncode != 0 or not smi.stdout.strip():
-    raise RuntimeError('No GPU. Runtime > Change runtime type > L4 GPU, then Run all.')
+    raise RuntimeError('No GPU. Runtime > Change runtime type > G4 GPU, then Run all.')
 GPU_NAME, _mb = [x.strip() for x in smi.stdout.strip().splitlines()[0].split(',')]
 GPU_GB, RAM_GB, CPUS = int(float(_mb)) / 1024, psutil.virtual_memory().total / 2**30, os.cpu_count()
 print(f'GPU {GPU_NAME} ({GPU_GB:.0f} GB) | RAM {RAM_GB:.0f} GB | {CPUS} CPUs')
@@ -201,14 +209,14 @@ print(f'{MODE}: {NW} worker(s), {THREADS} CPU threads each')
 
 def n_done():
     return len([f for f in os.listdir(OUT) if f.startswith('mbpp_') and f.endswith('.json')])
-N_TOTAL = N_TASKS or 397
+N_TOTAL = min(x for x in (SAMPLE, N_TASKS, 397) if x)
 
 stop_sync = threading.Event()
 def copy_to_drive():
     if not DRIVE_OK:
         return
     for f in os.listdir(OUT):
-        if f.endswith('.json') or f in ('run_meta.json', 'eval.jsonl'):
+        if f.endswith('.json') or f.endswith('.jsonl'):
             src, dst = f'{OUT}/{f}', f'{DRIVE_OUT}/{f}'
             try:
                 if not os.path.exists(dst) or os.path.getmtime(src) > os.path.getmtime(dst):
@@ -224,6 +232,8 @@ def launch(i):
            '--shard', f'{i}/{NW}', '--threads', str(THREADS), '--check_cpu_limit', str(CHECK_CPU_LIMIT)]
     if N_TASKS:
         cmd += ['--n_tasks', str(N_TASKS)]
+    if SAMPLE:
+        cmd += ['--sample', str(SAMPLE), '--seed', str(SEED)]
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
                          env=ENV, cwd=REPO)
     sel.register(p.stdout, selectors.EVENT_READ, i)
@@ -291,14 +301,31 @@ if MODE.startswith('itergen'):
           '| fallback used:', sum(d['stats'].get('fallback_used', False) for d in stats.values()))
 if MODE == 'chopchop':
     s = [d['stats'] for d in stats.values()]
-    print('rejected by grammar', sum(x.get('rejected_by_grammar', 0) for x in s),
-          '| by pruner', sum(x.get('rejected_by_pruner', 0) for x in s),
-          '| per rule', {r: sum(x.get('rejected_by_rule', {}).get(r, 0) for x in s)
-                         for r in ('undeclared', 'break_outside_loop', 'no_eval')},
+    print('checks', sum(x['checks'] for x in s), '| rejected', sum(x['rejected'] for x in s),
           '| CPU limit hit', sum(x.get('limit_hit', False) for x in s),
           '| check errors', sum(x.get('check_errors', 0) for x in s))
-if DRIVE_OK:
-    shutil.copyfile(f'{OUT}/eval.jsonl', f'{DRIVE_OUT}/eval.jsonl')
+    # results under every lower limit, rebuilt from the per-check trace
+    r = subprocess.run([sys.executable, f'{REPO}/tools/limit_curve.py', OUT], capture_output=True, text=True, cwd=REPO)
+    print(r.stdout[-4000:], r.stderr[-2000:])
+copy_to_drive()
+""")
+
+md(r"""
+## 5b. ChopChop: who rejected each token (CPU only)
+
+For every rejected token, re-checks the same text with the grammar alone and with each pruner
+rule alone (tools/attribute_rejections.py). Runs on all CPUs after generation; it does not
+change any output. Skip it with `ATTRIBUTE = False` -- it can be run later on any machine.
+""")
+code(r"""
+ATTRIBUTE = True
+if MODE == 'chopchop' and ATTRIBUTE:
+    p = subprocess.Popen([sys.executable, '-u', f'{REPO}/tools/attribute_rejections.py', OUT],
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=REPO, env=ENV)
+    for line in p.stdout:
+        print(line.rstrip(), flush=True)
+    p.wait()
+    copy_to_drive()
 """)
 
 md("## 6. Download (optional; everything is also on Drive)")
@@ -311,7 +338,7 @@ except Exception as e:
     print('download did not start:', type(e).__name__, '-- the files are on Drive:', DRIVE_OUT)
 """)
 
-nb = dict(cells=cells, metadata=dict(accelerator='GPU', colab=dict(gpuType='L4', provenance=[]),
+nb = dict(cells=cells, metadata=dict(accelerator='GPU', colab=dict(provenance=[]),
                                      kernelspec=dict(display_name='Python 3', name='python3'),
                                      language_info=dict(name='python')), nbformat=4, nbformat_minor=0)
 for c in nb['cells']:

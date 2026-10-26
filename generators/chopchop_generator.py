@@ -43,6 +43,7 @@ if str(CHOPCHOP_ROOT) not in sys.path:
     sys.path.insert(0, str(CHOPCHOP_ROOT))
 
 from core.rewrite import rewriter  # type: ignore  # noqa: E402
+from core.grammar import as_tree  # type: ignore  # noqa: E402
 from llm.realizability import RealizabilityChecker  # type: ignore  # noqa: E402
 from llm.run_llm import Config, LanguageModelRunner, ModelConfig  # type: ignore  # noqa: E402
 import llm.run_llm as _run_llm  # type: ignore  # noqa: E402
@@ -53,6 +54,19 @@ from .kv_cache import RewindableCache, text_config  # noqa: E402
 
 class CheckLimitReached(Exception):
     """The task used up its check-time limit; generation stops here."""
+
+
+def clear_chopchop_caches(lexerspec):
+    """Empty ChopChop's memo tables: the rewriter's, as_tree's and the lexer's.
+
+    They only memoise (results do not depend on them), but they make a check faster when an
+    earlier check visited the same states. Upstream never empties them, so a task's check time
+    would depend on which tasks ran before it in the same process -- and with several workers
+    that depends on the worker count. Emptying them before each task removes that.
+    """
+    rewriter.clear()
+    as_tree.cache_clear()
+    lexerspec.lexical_cache.cache.clear()
 
 
 class _SafeRealizabilityChecker(RealizabilityChecker):
@@ -70,39 +84,36 @@ class _SafeRealizabilityChecker(RealizabilityChecker):
         way, at a median of 183 characters). CPU time instead of wall-clock time makes the
         cut-off independent of what else runs on the machine, so several workers in
         parallel give the same outputs as one.
-      - Rejection attribution: when a token is rejected, the same prefix is re-checked
-        with the grammar alone, and -- if the grammar accepts it -- with each pruner rule
-        alone, to record WHO rejected it. These re-checks run only on rejections, do not
-        change the decision, and are timed separately (not counted toward the limit).
-
-    The rewriter's global state is cleared around the attribution re-checks: its memo
-    cache is keyed on the arguments, not on which pruner rules are active.
+      - A trace of every check, `stats['trace']`: one row per check,
+        [cumulative check CPU s, wall s since the task started, accepted (1/0), final (1/0),
+         keep, add]. The checked text is the last ACCEPTED text (at first: the fixed prefix)
+         cut to `keep` characters, plus `add`. From it:
+           * the output under any smaller limit can be rebuilt exactly (the run is the same
+             up to the first check at which the cumulative CPU time reaches the limit), see
+             tools/limit_curve.py;
+           * each rejection can be traced to the grammar or a pruner rule afterwards, off the
+             GPU, see tools/attribute_rejections.py. (Doing that here re-checked every
+             rejected text up to four times and emptied the memo tables, which slowed the
+             real checks down and so could change where a task hit its limit.)
     """
 
-    def __init__(self, constraint, parser, lexerspec, *, check_cpu_limit_s: Optional[float] = None,
-                 attribute_rejections: bool = True, max_samples: int = 30):
+    def __init__(self, constraint, parser, lexerspec, *, check_cpu_limit_s: Optional[float] = None):
         super().__init__(constraint, parser, lexerspec)
         self.check_cpu_limit_s = check_cpu_limit_s
-        self.attribute_rejections = attribute_rejections
-        self.max_samples = max_samples
-        self._grammar_only = RealizabilityChecker(lambda asts: asts, parser, lexerspec)
-        # A pruner may expose its rules (see javascript_chopchop.make_js_pruner) so that a
-        # rejection can be traced to the rule(s) that caused it.
-        self.rules = tuple(getattr(constraint, 'rules', ()))
-        self.reset_budget()
+        self.reset()
 
-    def reset_budget(self):
-        """Reset the per-task counters (call before each generation run)."""
+    def reset(self, base: str = ''):
+        """Per-task reset (call before each generation run): counters, trace, memo tables.
+        `base`: the text the run starts from (the fixed prefix); the trace is relative to it."""
+        clear_chopchop_caches(self.lexerspec)
         self.stats = {
-            'checks': 0, 'check_cpu_s': 0.0, 'check_wall_s': 0.0,
-            'rejected': 0, 'rejected_by_grammar': 0, 'rejected_by_pruner': 0,
-            'rejected_by_rule': {r: 0 for r in self.rules},
-            'rejection_samples': [],          # [{'tail', 'by', 'rules'}], first max_samples
-            'attribution_wall_s': 0.0,
-            'check_errors': 0, 'check_error_msg': None,
-            'limit_hit': False,
+            'checks': 0, 'check_cpu_s': 0.0, 'check_wall_s': 0.0, 'rejected': 0,
+            'check_errors': 0, 'check_error_msg': None, 'limit_hit': False,
+            'trace': [],
         }
         self.last_accepted = None
+        self._base = base
+        self._t0 = time.perf_counter()
 
     def realizable(self, prefix: str, final: bool = False) -> bool:
         st = self.stats
@@ -119,42 +130,34 @@ class _SafeRealizabilityChecker(RealizabilityChecker):
         st['check_wall_s'] += time.perf_counter() - w0
         st['checks'] += 1
 
+        base = self.last_accepted if self.last_accepted is not None else self._base
+        keep = 0
+        for a, b in zip(base, prefix):
+            if a != b:
+                break
+            keep += 1
+        st['trace'].append([round(st['check_cpu_s'], 3), round(time.perf_counter() - self._t0, 3),
+                            int(result), int(final), keep, prefix[keep:]])
         if result:
             self.last_accepted = prefix
         else:
             st['rejected'] += 1
-            if self.attribute_rejections:
-                self._attribute(prefix, final)
 
         if self.check_cpu_limit_s is not None and st['check_cpu_s'] >= self.check_cpu_limit_s:
             st['limit_hit'] = True
             raise CheckLimitReached()
         return result
 
-    def _attribute(self, prefix: str, final: bool):
-        st = self.stats
-        w0 = time.perf_counter()
-        try:
-            rewriter.clear()
-            if not self._grammar_only.realizable(prefix, final=final):
-                by, rules = 'grammar', []
-            else:
-                by, rules = 'pruner', []
-                for rule in self.rules:
-                    with self.constraint.only(rule):
-                        rewriter.clear()
-                        if not RealizabilityChecker.realizable(self, prefix, final=final):
-                            rules.append(rule)
-                for rule in rules:
-                    st['rejected_by_rule'][rule] += 1
-            st['rejected_by_' + by] += 1
-        except Exception as e:
-            by, rules = f'unknown ({type(e).__name__})', []
-        finally:
-            rewriter.clear()
-            st['attribution_wall_s'] += time.perf_counter() - w0
-        if len(st['rejection_samples']) < self.max_samples:
-            st['rejection_samples'].append({'tail': prefix[-80:], 'by': by, 'rules': rules})
+
+def replay_trace(trace, base=''):
+    """Yield (row, checked_text, accepted_text_after_this_check) for each row of a trace.
+    `base`: the text the run started from (stats['fixed_prefix'])."""
+    accepted = base
+    for row in trace:
+        text = accepted[:row[4]] + row[5]
+        if row[2]:
+            accepted = text
+        yield row, text, accepted
 
 
 class _LocalLanguageModelRunner(LanguageModelRunner):
@@ -357,7 +360,6 @@ class ChopchopGenerator(BaseGenerator):
         self.checker = _SafeRealizabilityChecker(
             effective_pruner, parser, lexer_spec,
             check_cpu_limit_s=kwargs.get("check_cpu_limit_s"),
-            attribute_rejections=kwargs.get("attribute_rejections", True),
         )
 
         self.runner = _LocalLanguageModelRunner(ModelConfig(model_id=model_name))
@@ -406,7 +408,7 @@ class ChopchopGenerator(BaseGenerator):
         if not task_prompt:
             task_prompt = self.build_prompt_fn(prompt)
 
-        self.checker.reset_budget()
+        self.checker.reset(base=fixed_prefix)
         RewindableCache.reprefills = 0
         cfg_kwargs = dict(temperature=temperature, max_new_tokens=max_new_tokens)
         if wall_timeout is not None:
@@ -436,7 +438,7 @@ class ChopchopGenerator(BaseGenerator):
             self.checker.stats,
             check_cpu_s=round(self.checker.stats['check_cpu_s'], 3),
             check_wall_s=round(self.checker.stats['check_wall_s'], 3),
-            attribution_wall_s=round(self.checker.stats['attribution_wall_s'], 3),
+            fixed_prefix=fixed_prefix,
             llm_finished=run_info.llm_finished if run_info else False,
             wall_timed_out=run_info.timed_out if run_info else False,
             tokens=(run_info.num_tokens_generated - n_prefix) if run_info else
@@ -445,6 +447,11 @@ class ChopchopGenerator(BaseGenerator):
             reprefills=RewindableCache.reprefills,
         )
 
+        return self.finish_output(output, fixed_prefix, stop_tokens)
+
+    @staticmethod
+    def finish_output(output: str, fixed_prefix: str, stop_tokens) -> str:
+        """Turn ChopChop's raw output into the completion appended to the prompt."""
         # The grammar start rule produces "function foo(…) { body }".
         # Strip fixed_prefix and the opening "{" since the caller's prompt
         # already contains them, leaving only "body }" to append.
@@ -453,6 +460,4 @@ class ChopchopGenerator(BaseGenerator):
             if output.startswith("{"):
                 output = output[1:]
 
-        output = self._post_process_stop(output, stop_tokens)
-
-        return output
+        return BaseGenerator._post_process_stop(None, output, stop_tokens)

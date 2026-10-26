@@ -22,6 +22,7 @@ python run.py --model Qwen/Qwen2.5-Coder-3B-Instruct --mode itergen_on --out res
 
 The run writes one JSON file per task to `--out`, and re-running the same command resumes it.
 `--shard i/N` splits a run over N processes. `--n_tasks 20` runs a smoke test.
+`--sample 60 --seed 0` runs 60 tasks drawn at random (the same 60 for every model).
 `--out/run_meta.json` records the settings and the environment (GPU, CPU, versions, commit).
 
 ## What each output records
@@ -43,25 +44,35 @@ the mode:
     off for that token.
   - `forward_errors`, `reprefills`, and `tokens`.
 - **ChopChop**:
-  - `checks`, `check_cpu_s`, and `check_wall_s`.
-  - `rejected`, split into `rejected_by_grammar` and `rejected_by_pruner`, with
-    `rejected_by_rule` per pruner rule (`undeclared`, `break_outside_loop`, `no_eval`).
-  - `rejection_samples`.
-  - `limit_hit`, `check_errors`, `llm_finished`, and `tokens`.
+  - `checks`, `check_cpu_s`, `check_wall_s`, and `rejected`.
+  - `limit_hit`, `check_errors`, `llm_finished`, `tokens`, and `fixed_prefix`.
+  - `trace`: one row per check, `[cumulative check CPU s, wall s, accepted, final, keep, add]`.
+    The checked text is the last accepted text cut to `keep` characters, plus `add`.
 
-Rejection attribution re-checks a rejected prefix with the grammar alone, then with one pruner
-rule at a time. It runs only on rejections and never changes a decision. Its time is reported
-separately as `attribution_wall_s`.
+Two tools read the trace after the run, without a GPU:
+
+- `tools/limit_curve.py RUN_DIR` rebuilds every completion as it would have been under each
+  lower check-time limit, runs it under node, and tabulates pass / syntax / semantic / other
+  and time per limit. This works because a run is identical up to the point where the limit
+  stops it.
+- `tools/attribute_rejections.py RUN_DIR` re-checks each rejected text with the grammar alone,
+  then with one pruner rule at a time, to record who rejected it (`attribution.jsonl`).
+  Doing this during generation slowed the real checks down and could change where a task hit
+  its limit, so it is done afterwards.
 
 ## Time limits
 
 - **IterGen**: a 60 s wall-clock limit per task. After it, an unconstrained 128-token completion
   closes the function. This is unchanged from the original integration.
-- **ChopChop**: a per-task limit on check time, measured as CPU time (`--check_cpu_limit`,
-  default 1800 s). When it is reached, generation stops at the last accepted token, so every
-  emitted token was checked.
+- **ChopChop**: a per-task limit on check time, measured as CPU time (`--check_cpu_limit`).
+  When it is reached, generation stops at the last accepted token, so every emitted token was
+  checked.
   - This replaces an earlier 120 s budget after which tokens were accepted unchecked.
+  - The value is chosen from a pilot run with a high limit, using `tools/limit_curve.py`.
   - Because the limit is CPU time, parallel workers give the same outputs as a single worker.
+    ChopChop's memo tables are emptied before each task for the same reason: otherwise a task's
+    check time would depend on which tasks ran before it in the same process.
+  - A faster CPU checks more within the same limit, so all runs use one runtime type.
 
 ## Where the code comes from, and what was changed
 
@@ -82,11 +93,12 @@ separately as `attribution_wall_s`.
     - `const_reassign` missed `++`/`--`.
   - `kv_cache.py` provides a rewindable KV cache, used by both tools, for transformers 5.x and
     hybrid models.
-  - The ChopChop wrapper uses the CPU-time limit and rejection attribution described above. Its
-    chat template is rendered with `enable_thinking=False`, because Qwen3.5's template
-    otherwise opens a `<think>` block. Qwen2.5's template is unaffected.
-    - The JS pruner gained per-rule switches for the attribution. With all rules on, which is
-      always the case outside attribution, its decisions are unchanged.
+  - The ChopChop wrapper uses the CPU-time limit and the check trace described above, and
+    empties ChopChop's memo tables before each task. Its chat template is rendered with
+    `enable_thinking=False`, because Qwen3.5's template otherwise opens a `<think>` block.
+    Qwen2.5's template is unaffected.
+    - The JS pruner gained per-rule switches for the attribution tool. With all rules on, which
+      is always the case during generation, its decisions are unchanged.
     - The pruner's known false rejections were deliberately **not** fixed: parenthesised arrow
       parameters, `new X()` declarations, hoisting, block `var`, and globals missing from its
       list.

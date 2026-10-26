@@ -3,6 +3,7 @@
 usage:
   python run.py --model Qwen/Qwen2.5-Coder-3B-Instruct --mode itergen_on --out results/q25/itergen_on
   python run.py ... --shard 0/4        # this process does tasks 0, 4, 8, ... (run 4 of them)
+  python run.py ... --sample 60        # 60 tasks drawn at random with a fixed seed (pilot)
 
 modes:
   unconstrained   plain greedy decoding (raw prompt)
@@ -40,6 +41,9 @@ def parse_args():
     p.add_argument('--out', required=True)
     p.add_argument('--max_new_tokens', type=int, default=512)
     p.add_argument('--n_tasks', type=int, default=None, help='first N tasks only (smoke test)')
+    p.add_argument('--sample', type=int, default=None,
+                   help='N tasks drawn at random (seed --seed); the same N tasks for every model')
+    p.add_argument('--seed', type=int, default=0)
     p.add_argument('--shard', default='0/1', help='i/N: do every N-th task starting at i')
     p.add_argument('--check_cpu_limit', type=float, default=1800.0,
                    help='chopchop: per-task limit on check CPU seconds (0 = none)')
@@ -117,7 +121,8 @@ def main():
 
     settings = dict(model=args.model, mode=args.mode, max_new_tokens=args.max_new_tokens,
                     decoding='greedy', dataset=os.path.relpath(DATASET, REPO),
-                    check_cpu_limit_s=(args.check_cpu_limit or None) if args.mode == 'chopchop' else None)
+                    check_cpu_limit_s=(args.check_cpu_limit or None) if args.mode == 'chopchop' else None,
+                    sample=args.sample, seed=args.seed if args.sample else None)
     meta_path = os.path.join(args.out, 'run_meta.json')
     env = environment()
     if os.path.exists(meta_path):
@@ -129,9 +134,16 @@ def main():
             print(f'NOTE: environment differs from the one recorded in {meta_path}:\n'
                   f'  then {old["env"]}\n  now  {env}', flush=True)
     else:
-        json.dump(dict(settings=settings, env=env), open(meta_path, 'w'), indent=1)
+        # atomic: the other workers may read it at the same moment
+        tmp = f'{meta_path}.{shard_i}.tmp'
+        json.dump(dict(settings=settings, env=env), open(tmp, 'w'), indent=1)
+        os.replace(tmp, meta_path)
 
     tasks = [json.loads(l) for l in open(DATASET) if l.strip()]
+    if args.sample:
+        import random
+        keep = set(random.Random(args.seed).sample(range(len(tasks)), args.sample))
+        tasks = [t for i, t in enumerate(tasks) if i in keep]
     if args.n_tasks:
         tasks = tasks[:args.n_tasks]
     todo = [t for i, t in enumerate(tasks) if i % shard_n == shard_i
