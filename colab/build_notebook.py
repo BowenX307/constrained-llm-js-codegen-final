@@ -3,6 +3,7 @@
 COLAB_DIR/run_final.ipynb   one model x one mode per Run all (settings in section 1)
 COLAB_DIR/queue_A.ipynb     ChopChop, both models, one after the other -- nothing to edit
 COLAB_DIR/queue_B.ipynb     unconstrained, IterGen off, IterGen on, both models -- nothing to edit
+COLAB_DIR/queue_all.ipynb   all 8 runs (A and B together) in one session -- nothing to edit
 The queue notebooks run the same steps as run_final.ipynb, in a loop over their QUEUE.
 """
 import json, os, sys, textwrap
@@ -428,3 +429,10 @@ queue_notebook('queue_B.ipynb', 'Queue B: unconstrained and IterGen, both models
                [(m, mode) for m in MODELS for mode in ('unconstrained', 'itergen_off', 'itergen_on')],
                'Runs unconstrained, IterGen with semantic checks off, and IterGen with checks on, on all '
                '397 tasks, Qwen2.5 then Qwen3.5; each is evaluated with node when it finishes.')
+queue_notebook('queue_all.ipynb', 'Queue: all 8 runs in one session',
+               [('Qwen/Qwen2.5-3B-Instruct', 'chopchop')]
+               + [(m, mode) for m in MODELS for mode in ('unconstrained', 'itergen_off', 'itergen_on')]
+               + [('Qwen/Qwen3.5-4B', 'chopchop')],
+               'Runs all 8 runs one after the other: Qwen2.5 ChopChop first, Qwen3.5 ChopChop (the '
+               'longest) last. Same steps, settings and Drive folders as queue_A and queue_B, so runs '
+               'that either of them finished are skipped and a half-done run continues.')
