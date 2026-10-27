@@ -1,10 +1,27 @@
-"""Build final/colab/run_final.ipynb. usage: python build_nb.py OUT.ipynb REPO_COMMIT"""
-import json, sys
+"""Build the Colab notebooks. usage: python build_notebook.py COLAB_DIR REPO_COMMIT
 
-OUT, COMMIT = sys.argv[1], sys.argv[2]
+COLAB_DIR/run_final.ipynb   one model x one mode per Run all (settings in section 1)
+COLAB_DIR/queue_A.ipynb     ChopChop, both models, one after the other -- nothing to edit
+COLAB_DIR/queue_B.ipynb     unconstrained, IterGen off, IterGen on, both models -- nothing to edit
+The queue notebooks run the same steps as run_final.ipynb, in a loop over their QUEUE.
+"""
+import json, os, sys, textwrap
+
+OUT_DIR, COMMIT = sys.argv[1], sys.argv[2]
 cells = []
 def md(s): cells.append(dict(cell_type='markdown', metadata={}, source=s.strip('\n')))
-def code(s): cells.append(dict(cell_type='code', metadata={}, execution_count=None, outputs=[], source=s.strip('\n')))
+def code(s):
+    cells.append(dict(cell_type='code', metadata={}, execution_count=None, outputs=[], source=s.strip('\n')))
+    return s.strip('\n')
+def save(path, cells):
+    nb = dict(cells=cells, metadata=dict(accelerator='GPU', colab=dict(provenance=[]),
+                                         kernelspec=dict(display_name='Python 3', name='python3'),
+                                         language_info=dict(name='python')), nbformat=4, nbformat_minor=0)
+    for c in nb['cells']:
+        src = c['source']
+        c['source'] = [l + '\n' for l in src.split('\n')[:-1]] + [src.split('\n')[-1]]
+    json.dump(nb, open(path, 'w'), indent=1)
+    print('wrote', path)
 
 md(r"""
 # Final experiments: one model, one mode per run
@@ -42,30 +59,24 @@ N_TASKS    = 20                           # 20 = smoke test; None = all 397
 SAMPLE     = None                         # chopchop pilot: 60 = 60 tasks drawn at random (same for both models)
 SEED       = 0
 N_WORKERS  = 'auto'                       # 'auto': 1, or for chopchop as many as fit
-CHECK_CPU_LIMIT = 1200                    # chopchop: per-task check CPU seconds (from the pilot; pilot used 3600)
+CHECK_CPU_LIMIT = 600                     # chopchop: per-task check CPU seconds (from the pilot; pilot used 3600)
 EXPECT_GPU = 'RTX PRO 6000'               # G4; every final run uses the same GPU type
 REPO_URL    = 'https://github.com/BowenX307/constrained-llm-js-codegen-final.git'
 REPO_COMMIT = '{COMMIT}'
 """)
+SETTINGS_END = len(cells)
 
 md("## 2. Runtime, Drive, code, packages")
-code(r"""
+SETUP = r"""
 import os, sys, json, time, shutil, glob, subprocess, threading
 import psutil
 
-assert MODE in ('unconstrained', 'itergen_off', 'itergen_on', 'chopchop'), MODE
 REPO   = '/content/final'
 CACHE  = '/content/cache'
 WORK   = '/content/work'
-SLUG   = MODEL.split('/')[-1]
-RUN    = (MODE + (f'_lim{CHECK_CPU_LIMIT:g}' if MODE == 'chopchop' else '')
-          + (f'_sample{SAMPLE}seed{SEED}' if SAMPLE else '') + '_' + REPO_COMMIT[:7])
-OUT    = f'{WORK}/{SLUG}/{RUN}'
 DRIVE_ROOT = '/content/drive/MyDrive/constrained-llm-js-codegen'     # same folder as the earlier runs
-DRIVE_OUT  = f'{DRIVE_ROOT}/final/{SLUG}/{RUN}'
 MS_DRIVE   = f'{DRIVE_ROOT}/mask_store_zst'                          # compressed mask stores, reused
-os.makedirs(OUT, exist_ok=True); os.makedirs(CACHE, exist_ok=True)
-
+os.makedirs(CACHE, exist_ok=True)
 smi = subprocess.run(['nvidia-smi', '--query-gpu=name,memory.total', '--format=csv,noheader,nounits'],
                      capture_output=True, text=True)
 if smi.returncode != 0 or not smi.stdout.strip():
@@ -83,14 +94,7 @@ try:
 except Exception as e:
     print('Drive not mounted:', type(e).__name__)
 DRIVE_OK = os.path.isdir('/content/drive/MyDrive')
-if DRIVE_OK:
-    os.makedirs(DRIVE_OUT, exist_ok=True)
-    restored = 0
-    for f in os.listdir(DRIVE_OUT):
-        if (f.endswith('.json') or f == 'run_meta.json') and not os.path.exists(f'{OUT}/{f}'):
-            shutil.copy(f'{DRIVE_OUT}/{f}', f'{OUT}/{f}'); restored += 1
-    print(f'Drive: {restored} files restored from {DRIVE_OUT}')
-else:
+if not DRIVE_OK:
     print('WARNING: no Drive -- a disconnect that recycles the VM loses the outputs.')
 
 if os.path.isdir(REPO):
@@ -110,11 +114,13 @@ def pip(*a):
 def importable(stmt):
     return subprocess.run([sys.executable, '-c', stmt], cwd=REPO, capture_output=True).returncode == 0
 
-import transformers
-if transformers.__version__ != '5.20.1':
+from importlib.metadata import version
+if version('transformers') != '5.20.1':
+    was = version('transformers')
     pip('transformers==5.20.1')
-    raise RuntimeError(f'transformers was {transformers.__version__}; installed 5.20.1. '
-                       'Runtime > Restart session, then Run all.')
+    if 'transformers' in sys.modules:    # the old version is already loaded in this session
+        raise RuntimeError(f'transformers was {was}; installed 5.20.1. Runtime > Restart session, then Run all.')
+import transformers
 pip('lark', 'regex', 'networkx', 'fire', 'interegular', 'tqdm', 'datasets', 'jsonschema', 'psutil')
 if not importable('from syncode.parsers.itergen_parser import IGParser'):
     # GitHub, pinned, --no-deps (so it cannot replace torch / transformers)
@@ -129,7 +135,25 @@ print('transformers', transformers.__version__, '| torch', torch.__version__,
 ENV = dict(os.environ, SYNCODE_CACHE=CACHE + '/syncode/', HF_HOME=CACHE + '/hf_home',
            TOKENIZERS_PARALLELISM='false', PYTHONUNBUFFERED='1', PYTHONPATH=REPO,
            HF_HUB_DISABLE_PROGRESS_BARS='1')
-""")
+"""
+PATHS = r"""
+assert MODE in ('unconstrained', 'itergen_off', 'itergen_on', 'chopchop'), MODE
+SLUG   = MODEL.split('/')[-1]
+RUN    = (MODE + (f'_lim{CHECK_CPU_LIMIT:g}' if MODE == 'chopchop' else '')
+          + (f'_sample{SAMPLE}seed{SEED}' if SAMPLE else '') + '_' + REPO_COMMIT[:7])
+OUT    = f'{WORK}/{SLUG}/{RUN}'
+DRIVE_OUT  = f'{DRIVE_ROOT}/final/{SLUG}/{RUN}'
+os.makedirs(OUT, exist_ok=True)
+if DRIVE_OK:
+    os.makedirs(DRIVE_OUT, exist_ok=True)
+    restored = 0
+    for f in os.listdir(DRIVE_OUT):
+        if f.endswith('.json') and not os.path.exists(f'{OUT}/{f}'):
+            shutil.copy(f'{DRIVE_OUT}/{f}', f'{OUT}/{f}'); restored += 1
+    print(f'Drive: {restored} files restored from {DRIVE_OUT}')
+"""
+code(SETUP + PATHS)
+SETUP_CELL = len(cells) - 1
 
 md(r"""
 ## 3. Grammar mask store (IterGen modes only)
@@ -139,7 +163,7 @@ from the earlier runs: Qwen2.5 (its tokenizer is identical to Qwen2.5-Coder's) a
 This cell restores the right one in about a minute. If none is there, it builds one, which takes
 about 30 min, and saves a compressed copy to Drive.
 """)
-code(r"""
+MS = code(r"""
 if MODE.startswith('itergen'):
     GRAMMAR = f'{REPO}/generators/grammars/javascript.lark'
     probe = subprocess.run([sys.executable, '-c',
@@ -195,7 +219,7 @@ md(r"""
 Each worker is `python run.py --shard i/N`. A worker that crashes is restarted; `run.py` skips
 the tasks that are already done. Finished outputs are copied to Drive every minute.
 """)
-code(r"""
+GEN = code(r"""
 import selectors
 
 if N_WORKERS != 'auto':
@@ -284,7 +308,7 @@ if fatal:
 """)
 
 md("## 5. Evaluate with node")
-code(r"""
+EVAL = code(r"""
 r = subprocess.run([sys.executable, f'{REPO}/evaluate.py', OUT], capture_output=True, text=True, cwd=REPO)
 print(r.stdout[-6000:], r.stderr[-2000:])
 recs = [json.loads(l) for l in open(f'{OUT}/eval.jsonl')]
@@ -321,7 +345,7 @@ change any output. At most 30 evenly spaced rejections per task are re-checked (
 would take hours for a task with thousands). Skip it with `ATTRIBUTE = False` -- it can be
 run later on any machine.
 """)
-code(r"""
+ATTR = code(r"""
 ATTRIBUTE = True
 if MODE == 'chopchop' and ATTRIBUTE:
     p = subprocess.Popen([sys.executable, '-u', f'{REPO}/tools/attribute_rejections.py', OUT],
@@ -342,11 +366,65 @@ except Exception as e:
     print('download did not start:', type(e).__name__, '-- the files are on Drive:', DRIVE_OUT)
 """)
 
-nb = dict(cells=cells, metadata=dict(accelerator='GPU', colab=dict(provenance=[]),
-                                     kernelspec=dict(display_name='Python 3', name='python3'),
-                                     language_info=dict(name='python')), nbformat=4, nbformat_minor=0)
-for c in nb['cells']:
-    src = c['source']
-    c['source'] = [l + '\n' for l in src.split('\n')[:-1]] + [src.split('\n')[-1]]
-json.dump(nb, open(OUT, 'w'), indent=1)
-print('wrote', OUT)
+
+save(os.path.join(OUT_DIR, 'run_final.ipynb'), cells)
+
+
+# ---- queue notebooks: the same steps, in a loop, with nothing to edit
+def queue_notebook(name, title, queue, note):
+    q = ',\n'.join(f'    ({m!r}, {mode!r})' for m, mode in queue)
+    qcells = []
+    qcells.append(dict(cell_type='markdown', metadata={}, source=textwrap.dedent(f"""
+        # {title}
+
+        **Runtime: G4 GPU** (NVIDIA RTX PRO 6000; Runtime > Change runtime type), then
+        **Runtime > Run all**. Nothing to edit.
+
+        {note}
+
+        After a disconnect, Run all again: runs that finished are skipped, the unfinished one
+        continues where it stopped. Outputs go to the same Drive folders as
+        `run_final.ipynb` (`constrained-llm-js-codegen/final/<model>/<run>`), plus a
+        `queue_done.txt` in each finished run's folder.
+        """).strip('\n')))
+    settings = (f"QUEUE = [\n{q},\n]\n"
+                "N_TASKS    = None                         # all 397\n"
+                "SAMPLE     = None\n"
+                "SEED       = 0\n"
+                "N_WORKERS  = 'auto'                       # 1, or for chopchop as many as fit\n"
+                "CHECK_CPU_LIMIT = 600                     # chopchop: per-task check CPU seconds (from the pilot)\n"
+                "EXPECT_GPU = 'RTX PRO 6000'               # G4; every final run uses the same GPU type\n"
+                "REPO_URL    = 'https://github.com/BowenX307/constrained-llm-js-codegen-final.git'\n"
+                f"REPO_COMMIT = '{COMMIT}'")
+    qcells.append(dict(cell_type='code', metadata={}, execution_count=None, outputs=[], source=settings))
+    qcells.append(dict(cell_type='code', metadata={}, execution_count=None, outputs=[], source=SETUP.strip('\n')))
+    body = '\n'.join(textwrap.indent(s, ' ' * 8) for s in (MS, GEN, EVAL, ATTR))
+    loop = (
+        "import traceback\n"
+        "for MODEL, MODE in QUEUE:\n"
+        "    print('=' * 100 + f'\\n{MODEL}  {MODE}\\n' + '=' * 100, flush=True)\n"
+        + textwrap.indent(PATHS.strip('\n'), ' ' * 4) + "\n"
+        "    if DRIVE_OK and os.path.exists(f'{DRIVE_OUT}/queue_done.txt'):\n"
+        "        print('finished earlier: skipped'); continue\n"
+        "    try:\n"
+        + body + "\n"
+        "    except Exception:\n"
+        "        traceback.print_exc()\n"
+        "        print('!!! this run did not finish; going on with the next one (Run all again later)', flush=True)\n"
+        "        continue\n"
+        "    if DRIVE_OK:\n"
+        "        open(f'{DRIVE_OUT}/queue_done.txt', 'w').write(time.strftime('%Y-%m-%d %H:%M:%S\\n'))\n"
+        "print('queue finished')\n")
+    qcells.append(dict(cell_type='code', metadata={}, execution_count=None, outputs=[], source=loop))
+    save(os.path.join(OUT_DIR, name), qcells)
+
+
+MODELS = ('Qwen/Qwen2.5-3B-Instruct', 'Qwen/Qwen3.5-4B')
+queue_notebook('queue_A.ipynb', 'Queue A: ChopChop, both models',
+               [(m, 'chopchop') for m in MODELS],
+               'Runs ChopChop on all 397 tasks, Qwen2.5 then Qwen3.5, with a 600 s check-CPU limit per '
+               'task; then the node evaluation, the limit curve and the rejection attribution of each.')
+queue_notebook('queue_B.ipynb', 'Queue B: unconstrained and IterGen, both models',
+               [(m, mode) for m in MODELS for mode in ('unconstrained', 'itergen_off', 'itergen_on')],
+               'Runs unconstrained, IterGen with semantic checks off, and IterGen with checks on, on all '
+               '397 tasks, Qwen2.5 then Qwen3.5; each is evaluated with node when it finishes.')

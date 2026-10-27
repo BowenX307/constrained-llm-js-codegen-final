@@ -96,7 +96,7 @@ def judge(d, completion):
 
 
 def evaluate(run_dir):
-    files = sorted(f for f in os.listdir(run_dir) if f.endswith('.json') and f != 'run_meta.json')
+    files = sorted(f for f in os.listdir(run_dir) if f.startswith('mbpp_') and f.endswith('.json'))
     items = [load(os.path.join(run_dir, f)) for f in files]
     with ThreadPoolExecutor(max_workers=8) as ex:
         recs = list(ex.map(lambda x: judge(*x), items))
