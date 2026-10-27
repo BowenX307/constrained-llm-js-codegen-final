@@ -19,7 +19,9 @@ Notes:
   only the times: its limit is in CPU seconds, so a faster CPU checks more tokens within it.
 - `N_TASKS = 20` is a smoke test. Set it to `None` and Run all again for all 397 tasks; the 20 finished tasks are kept.
 - ChopChop pilot: `SAMPLE = 60`, `CHECK_CPU_LIMIT = 3600`. Section 5 then shows how the results
-  depend on the limit (tools/limit_curve.py), which is how the final limit is chosen.
+  depend on the limit (tools/limit_curve.py), which is how the final limit is chosen. On the
+  Qwen2.5 pilot pass@1 stopped changing at 600 s (27/60 from 600 s to 3600 s); the final runs use
+  1200 s, and section 5 shows every lower limit for all 397 tasks.
 - Outputs are copied to Google Drive as they finish. After a disconnect, Run all again to continue.
 - The code is pinned to one commit of
   [constrained-llm-js-codegen-final](https://github.com/BowenX307/constrained-llm-js-codegen-final),
@@ -40,7 +42,7 @@ N_TASKS    = 20                           # 20 = smoke test; None = all 397
 SAMPLE     = None                         # chopchop pilot: 60 = 60 tasks drawn at random (same for both models)
 SEED       = 0
 N_WORKERS  = 'auto'                       # 'auto': 1, or for chopchop as many as fit
-CHECK_CPU_LIMIT = 1800                    # chopchop: per-task check CPU seconds (pilot: 3600)
+CHECK_CPU_LIMIT = 1200                    # chopchop: per-task check CPU seconds (from the pilot; pilot used 3600)
 EXPECT_GPU = 'RTX PRO 6000'               # G4; every final run uses the same GPU type
 REPO_URL    = 'https://github.com/BowenX307/constrained-llm-js-codegen-final.git'
 REPO_COMMIT = '{COMMIT}'
@@ -315,7 +317,9 @@ md(r"""
 
 For every rejected token, re-checks the same text with the grammar alone and with each pruner
 rule alone (tools/attribute_rejections.py). Runs on all CPUs after generation; it does not
-change any output. Skip it with `ATTRIBUTE = False` -- it can be run later on any machine.
+change any output. At most 30 evenly spaced rejections per task are re-checked (all of them
+would take hours for a task with thousands). Skip it with `ATTRIBUTE = False` -- it can be
+run later on any machine.
 """)
 code(r"""
 ATTRIBUTE = True

@@ -1,7 +1,7 @@
 """Which part of ChopChop rejected each token: the grammar, or which pruner rule.
 
 usage:
-  python tools/attribute_rejections.py RUN_DIR [--workers N]
+  python tools/attribute_rejections.py RUN_DIR [--workers N] [--max_per_task 30]
 
 Runs on CPU, after generation. For every rejected check in a task's trace (see `trace` in
 generators/chopchop_generator.py), the same text is checked again
@@ -13,6 +13,11 @@ alone (none listed = only the rules together reject it).
 Each pass (grammar alone, each rule alone) goes through a task's rejected texts in order with
 its own empty memo tables, because the rewriter's memo is keyed on the arguments and not on
 which rules are active. Writes RUN_DIR/attribution.jsonl (one line per task) and prints totals.
+
+Re-checking costs about (1 + number of rules) times the task's own check time, so a task with
+thousands of rejections takes hours. --max_per_task attributes an evenly spaced sample of a
+task's rejections instead; `rejected` is the task's total, `attributed` the sample size, and the
+by_* counts are over the sample.
 """
 import argparse
 import json
@@ -20,6 +25,7 @@ import os
 import sys
 import time
 from collections import Counter
+from functools import partial
 from multiprocessing import Pool
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -33,13 +39,16 @@ def _init():
     _parts = build_checker_parts()
 
 
-def attribute(d):
+def attribute(d, max_per_task=None):
     from llm.realizability import RealizabilityChecker  # type: ignore
     from generators.chopchop_generator import clear_chopchop_caches
     lexerspec, parser, pruner = _parts
     t0 = time.perf_counter()
     rejected = [(text, bool(row[3])) for row, text, _ in replay_trace(d['stats']['trace'], d['stats']['fixed_prefix'])
                 if not row[2]]
+    n_rejected = len(rejected)
+    if max_per_task and n_rejected > max_per_task:      # evenly spaced sample, in order
+        rejected = [rejected[i * n_rejected // max_per_task] for i in range(max_per_task)]
 
     def run_pass(constraint, texts):
         clear_chopchop_caches(lexerspec)
@@ -68,7 +77,7 @@ def attribute(d):
         by = 'grammar' if g is False else 'pruner' if g is True else f'unknown ({g})'
         rows.append(dict(by=by, rules=rules_of.get(i, []), final=final, tail=text[-80:]))
     by_rule = Counter(r for x in rows for r in x['rules'])
-    return dict(name=d['name'], rejected=len(rows),
+    return dict(name=d['name'], rejected=n_rejected, attributed=len(rows),
                 by_grammar=sum(x['by'] == 'grammar' for x in rows),
                 by_pruner=sum(x['by'] == 'pruner' for x in rows),
                 by_pruner_no_single_rule=sum(x['by'] == 'pruner' and not x['rules'] for x in rows),
@@ -81,21 +90,23 @@ if __name__ == '__main__':
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('run_dir')
     p.add_argument('--workers', type=int, default=os.cpu_count())
+    p.add_argument('--max_per_task', type=int, default=30,
+                   help='attribute at most this many rejections per task, evenly spaced (0 = all)')
     a = p.parse_args()
     items = [d for d in load_run(a.run_dir) if d['stats']['rejected']]
     items.sort(key=lambda d: -d['stats']['rejected'])          # longest first
     out_path = os.path.join(a.run_dir, 'attribution.jsonl')
     t0, done = time.time(), []
     with Pool(a.workers, initializer=_init) as pool, open(out_path + '.tmp', 'w') as f:
-        for k, r in enumerate(pool.imap_unordered(attribute, items)):
+        for k, r in enumerate(pool.imap_unordered(partial(attribute, max_per_task=a.max_per_task), items)):
             f.write(json.dumps(r) + '\n'); f.flush()
             done.append(r)
-            print(f"[{k + 1}/{len(items)}] {r['name'][:40]:<41} {r['rejected']:4d} rejections  {r['seconds']:7.1f}s",
-                  flush=True)
+            print(f"[{k + 1}/{len(items)}] {r['name'][:40]:<41} {r['attributed']:4d} of {r['rejected']:5d} rejections"
+                  f"  {r['seconds']:7.1f}s", flush=True)
     os.replace(out_path + '.tmp', out_path)
     tot = Counter()
     for r in done:
-        tot.update(dict(rejected=r['rejected'], grammar=r['by_grammar'], pruner=r['by_pruner'],
+        tot.update(dict(rejected=r['rejected'], attributed=r['attributed'], grammar=r['by_grammar'], pruner=r['by_pruner'],
                         pruner_no_single_rule=r['by_pruner_no_single_rule'], unknown=r['unknown']))
         tot.update({'rule ' + k: v for k, v in r['by_rule'].items()})
     print(f'\n{a.run_dir}: {len(done)} tasks with rejections, {(time.time() - t0) / 60:.1f} min')
