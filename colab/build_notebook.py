@@ -1,14 +1,19 @@
-"""Build the Colab notebooks. usage: python build_notebook.py COLAB_DIR REPO_COMMIT
+"""Build the Colab notebooks. usage: python build_notebook.py COLAB_DIR REPO_COMMIT [RUN_TAG]
 
 COLAB_DIR/run_final.ipynb   one model x one mode per Run all (settings in section 1)
 COLAB_DIR/queue_A.ipynb     ChopChop, both models, one after the other -- nothing to edit
 COLAB_DIR/queue_B.ipynb     unconstrained, IterGen off, IterGen on, both models -- nothing to edit
 COLAB_DIR/queue_all.ipynb   all 8 runs (A and B together) in one session -- nothing to edit
 The queue notebooks run the same steps as run_final.ipynb, in a loop over their QUEUE.
+
+RUN_TAG ends the output folder names (default: the first 7 characters of REPO_COMMIT). Passing
+the tag of an earlier commit continues the runs in that commit's folders; the code commit of
+each session is still recorded (run_meta.json notes a change, and per-task stats show it).
 """
 import json, os, sys, textwrap
 
 OUT_DIR, COMMIT = sys.argv[1], sys.argv[2]
+RUN_TAG = sys.argv[3] if len(sys.argv) > 3 else COMMIT[:7]
 cells = []
 def md(s): cells.append(dict(cell_type='markdown', metadata={}, source=s.strip('\n')))
 def code(s):
@@ -61,9 +66,11 @@ SAMPLE     = None                         # chopchop pilot: 60 = 60 tasks drawn 
 SEED       = 0
 N_WORKERS  = 'auto'                       # 'auto': 1, or for chopchop as many as fit
 CHECK_CPU_LIMIT = 600                     # chopchop: per-task check CPU seconds (from the pilot; pilot used 3600)
+WALL_CAP   = 1800                         # chopchop: per-task wall-clock cap, a safety net (see run.py --wall_cap)
 EXPECT_GPU = 'RTX PRO 6000'               # G4; every final run uses the same GPU type
 REPO_URL    = 'https://github.com/BowenX307/constrained-llm-js-codegen-final.git'
 REPO_COMMIT = '{COMMIT}'
+RUN_TAG     = '{RUN_TAG}'                   # output folder suffix
 """)
 SETTINGS_END = len(cells)
 
@@ -141,7 +148,7 @@ PATHS = r"""
 assert MODE in ('unconstrained', 'itergen_off', 'itergen_on', 'chopchop'), MODE
 SLUG   = MODEL.split('/')[-1]
 RUN    = (MODE + (f'_lim{CHECK_CPU_LIMIT:g}' if MODE == 'chopchop' else '')
-          + (f'_sample{SAMPLE}seed{SEED}' if SAMPLE else '') + '_' + REPO_COMMIT[:7])
+          + (f'_sample{SAMPLE}seed{SEED}' if SAMPLE else '') + '_' + RUN_TAG)
 OUT    = f'{WORK}/{SLUG}/{RUN}'
 DRIVE_OUT  = f'{DRIVE_ROOT}/final/{SLUG}/{RUN}'
 os.makedirs(OUT, exist_ok=True)
@@ -231,12 +238,27 @@ elif MODE == 'chopchop':
 else:
     NW = 1
 THREADS = max(1, CPUS // NW)
-STALL_S = 3 * 3600 if MODE == 'chopchop' else 1800   # a worker silent this long is stuck
-print(f'{MODE}: {NW} worker(s), {THREADS} CPU threads each')
+CAP = WALL_CAP if MODE == 'chopchop' else 0
+STALL_S = CAP + 1800 if CAP else 3 * 3600 if MODE == 'chopchop' else 1800   # a worker silent this long is stuck
 
 def n_done():
     return len([f for f in os.listdir(OUT) if f.startswith('mbpp_') and f.endswith('.json')])
 N_TOTAL = min(x for x in (SAMPLE, N_TASKS, 397) if x)
+
+# the tasks not done yet, dealt out evenly to the workers (each gets its own list, kept on restart)
+SEL = (['--n_tasks', str(N_TASKS)] if N_TASKS else []) + (['--sample', str(SAMPLE), '--seed', str(SEED)] if SAMPLE else [])
+r = subprocess.run([sys.executable, f'{REPO}/run.py', '--model', MODEL, '--mode', MODE, '--out', OUT,
+                    '--list_todo'] + SEL, capture_output=True, text=True, env=ENV, cwd=REPO)
+if r.returncode != 0:
+    raise RuntimeError('run.py --list_todo failed:\n' + r.stderr[-2000:])
+TODO = r.stdout.split()
+NW = max(1, min(NW, len(TODO)))
+TASK_FILES = []
+for i in range(NW):
+    TASK_FILES.append(f'{WORK}/todo_{SLUG}_{MODE}_{i}.txt')
+    open(TASK_FILES[i], 'w').write('\n'.join(TODO[i::NW]) + '\n')
+print(f'{MODE}: {len(TODO)} tasks to do, {NW} worker(s), {THREADS} CPU threads each'
+      + (f', wall cap {CAP:g} s per task' if CAP else ''))
 
 stop_sync = threading.Event()
 def copy_to_drive():
@@ -256,11 +278,9 @@ def sync_to_drive():
 
 def launch(i):
     cmd = [sys.executable, '-u', f'{REPO}/run.py', '--model', MODEL, '--mode', MODE, '--out', OUT,
-           '--shard', f'{i}/{NW}', '--threads', str(THREADS), '--check_cpu_limit', str(CHECK_CPU_LIMIT)]
-    if N_TASKS:
-        cmd += ['--n_tasks', str(N_TASKS)]
-    if SAMPLE:
-        cmd += ['--sample', str(SAMPLE), '--seed', str(SEED)]
+           '--tasks_file', TASK_FILES[i], '--threads', str(THREADS), '--check_cpu_limit', str(CHECK_CPU_LIMIT)] + SEL
+    if CAP:
+        cmd += ['--wall_cap', str(CAP)]
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
                          env=ENV, cwd=REPO)
     sel.register(p.stdout, selectors.EVENT_READ, i)
@@ -330,6 +350,7 @@ if MODE == 'chopchop':
     s = [d['stats'] for d in stats.values()]
     print('checks', sum(x['checks'] for x in s), '| rejected', sum(x['rejected'] for x in s),
           '| CPU limit hit', sum(x.get('limit_hit', False) for x in s),
+          '| wall cap hit', sum(x.get('wall_cap_hit', False) for x in s),
           '| check errors', sum(x.get('check_errors', 0) for x in s))
     # results under every lower limit, rebuilt from the per-check trace
     r = subprocess.run([sys.executable, f'{REPO}/tools/limit_curve.py', OUT], capture_output=True, text=True, cwd=REPO)
@@ -394,9 +415,11 @@ def queue_notebook(name, title, queue, note):
                 "SEED       = 0\n"
                 "N_WORKERS  = 'auto'                       # 1, or for chopchop as many as fit\n"
                 "CHECK_CPU_LIMIT = 600                     # chopchop: per-task check CPU seconds (from the pilot)\n"
+                "WALL_CAP   = 1800                         # chopchop: per-task wall-clock cap, a safety net\n"
                 "EXPECT_GPU = 'RTX PRO 6000'               # G4; every final run uses the same GPU type\n"
                 "REPO_URL    = 'https://github.com/BowenX307/constrained-llm-js-codegen-final.git'\n"
-                f"REPO_COMMIT = '{COMMIT}'")
+                f"REPO_COMMIT = '{COMMIT}'\n"
+                f"RUN_TAG     = '{RUN_TAG}'                   # output folder suffix")
     qcells.append(dict(cell_type='code', metadata={}, execution_count=None, outputs=[], source=settings))
     qcells.append(dict(cell_type='code', metadata={}, execution_count=None, outputs=[], source=SETUP.strip('\n')))
     body = '\n'.join(textwrap.indent(s, ' ' * 8) for s in (MS, GEN, EVAL, ATTR))
@@ -413,6 +436,9 @@ def queue_notebook(name, title, queue, note):
         "        traceback.print_exc()\n"
         "        print('!!! this run did not finish; going on with the next one (Run all again later)', flush=True)\n"
         "        continue\n"
+        "    if n_done() < N_TOTAL:\n"
+        "        print(f'!!! only {n_done()}/{N_TOTAL} tasks done; going on with the next run (Run all again later)', flush=True)\n"
+        "        continue\n"
         "    if DRIVE_OK:\n"
         "        open(f'{DRIVE_OUT}/queue_done.txt', 'w').write(time.strftime('%Y-%m-%d %H:%M:%S\\n'))\n"
         "print('queue finished')\n")
@@ -424,7 +450,8 @@ MODELS = ('Qwen/Qwen2.5-3B-Instruct', 'Qwen/Qwen3.5-4B')
 queue_notebook('queue_A.ipynb', 'Queue A: ChopChop, both models',
                [(m, 'chopchop') for m in MODELS],
                'Runs ChopChop on all 397 tasks, Qwen2.5 then Qwen3.5, with a 600 s check-CPU limit per '
-               'task; then the node evaluation, the limit curve and the rejection attribution of each.')
+               'task and a 1800 s wall-clock cap per task (a safety net for tasks that run for hours with '
+               'almost no check time); then the node evaluation, the limit curve and the rejection attribution of each.')
 queue_notebook('queue_B.ipynb', 'Queue B: unconstrained and IterGen, both models',
                [(m, mode) for m in MODELS for mode in ('unconstrained', 'itergen_off', 'itergen_on')],
                'Runs unconstrained, IterGen with semantic checks off, and IterGen with checks on, on all '

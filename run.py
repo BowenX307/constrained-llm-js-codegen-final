@@ -4,6 +4,8 @@ usage:
   python run.py --model Qwen/Qwen2.5-Coder-3B-Instruct --mode itergen_on --out results/q25/itergen_on
   python run.py ... --shard 0/4        # this process does tasks 0, 4, 8, ... (run 4 of them)
   python run.py ... --sample 60        # 60 tasks drawn at random with a fixed seed (pilot)
+  python run.py ... --list_todo        # print the names of the tasks not done yet, and exit
+  python run.py ... --tasks_file F     # do only the tasks named in F (one per line)
 
 modes:
   unconstrained   plain greedy decoding (raw prompt)
@@ -47,6 +49,11 @@ def parse_args():
     p.add_argument('--shard', default='0/1', help='i/N: do every N-th task starting at i')
     p.add_argument('--check_cpu_limit', type=float, default=1800.0,
                    help='chopchop: per-task limit on check CPU seconds (0 = none)')
+    p.add_argument('--wall_cap', type=float, default=0,
+                   help='chopchop: per-task wall-clock cap in seconds, a safety net for tasks that '
+                        'run for hours with almost no check time (0 = none); recorded per task')
+    p.add_argument('--list_todo', action='store_true', help='print the tasks not done yet and exit')
+    p.add_argument('--tasks_file', default=None, help='do only the tasks named in this file')
     p.add_argument('--threads', type=int, default=None, help='torch CPU threads')
     return p.parse_args()
 
@@ -94,7 +101,8 @@ def build(args):
                              start_rule=JS_START_RULE, pruner_fn=make_js_pruner('basic'),
                              extract_prefix_fn=extract_js_prefix, build_prompt_fn=build_js_prompt,
                              context=JS_CONTEXT,
-                             check_cpu_limit_s=args.check_cpu_limit or None)
+                             check_cpu_limit_s=args.check_cpu_limit or None,
+                             wall_cap_s=args.wall_cap or None)
 
 
 def generate(gen, mode, task, max_new_tokens):
@@ -119,6 +127,19 @@ def main():
     shard_i, shard_n = (int(x) for x in args.shard.split('/'))
     os.makedirs(args.out, exist_ok=True)
 
+    tasks = [json.loads(l) for l in open(DATASET) if l.strip()]
+    if args.sample:
+        import random
+        keep = set(random.Random(args.seed).sample(range(len(tasks)), args.sample))
+        tasks = [t for i, t in enumerate(tasks) if i in keep]
+    if args.n_tasks:
+        tasks = tasks[:args.n_tasks]
+    if args.list_todo:
+        for t in tasks:
+            if not os.path.exists(os.path.join(args.out, t['name'] + '.json')):
+                print(t['name'])
+        return
+
     settings = dict(model=args.model, mode=args.mode, max_new_tokens=args.max_new_tokens,
                     decoding='greedy', dataset=os.path.relpath(DATASET, REPO),
                     check_cpu_limit_s=(args.check_cpu_limit or None) if args.mode == 'chopchop' else None,
@@ -139,13 +160,9 @@ def main():
         json.dump(dict(settings=settings, env=env), open(tmp, 'w'), indent=1)
         os.replace(tmp, meta_path)
 
-    tasks = [json.loads(l) for l in open(DATASET) if l.strip()]
-    if args.sample:
-        import random
-        keep = set(random.Random(args.seed).sample(range(len(tasks)), args.sample))
-        tasks = [t for i, t in enumerate(tasks) if i in keep]
-    if args.n_tasks:
-        tasks = tasks[:args.n_tasks]
+    if args.tasks_file:
+        mine = set(open(args.tasks_file).read().split())
+        tasks = [t for t in tasks if t['name'] in mine]
     todo = [t for i, t in enumerate(tasks) if i % shard_n == shard_i
             and not os.path.exists(os.path.join(args.out, t['name'] + '.json'))]
     print(f'{args.mode} | {args.model} | shard {args.shard}: {len(todo)} tasks to do', flush=True)

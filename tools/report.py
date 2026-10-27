@@ -17,7 +17,7 @@ Tables
   4 time                     generation time per task; time inside the checks
   5 IterGen semantic checks  how often each rule fired, and whether node still reports the
                              error that rule is about in the final program
-  6 ChopChop checks          checks, rejections, limit hits; grammar vs pruner rule (sampled)
+  6 ChopChop checks          checks, rejections, limit and wall-cap hits; grammar vs pruner rule (sampled)
   7 limit curve              ChopChop results under every lower check-CPU limit
   8 Qwen3.5 vs Qwen2.5       paired per task, with an exact McNemar test
   9 IterGen on vs off        paired per task
@@ -262,6 +262,7 @@ def t_chopchop(runs):
         rej = sum(x.get('rejected', 0) for x in s)
         rows.append([short(model), sum(x.get('checks', 0) for x in s), rej,
                      sum(1 for x in s if x.get('rejected')), sum(1 for x in s if x.get('limit_hit')),
+                     sum(1 for x in s if x.get('wall_cap_hit')),
                      sum(x.get('check_errors', 0) for x in s),
                      sum(1 for t in r['tasks'].values() if t.get('generation_error'))])
         att = load_jsonl(os.path.join(r['dir'], 'attribution.jsonl'))
@@ -284,7 +285,7 @@ def t_chopchop(runs):
                 rule_rows.append([short(model), k, f'{n:.0f}', pct(n, tot)])
             rule_rows.append([short(model), f'(re-checked {sampled} of {tot} rejections)', '', ''])
     out = md_table(['model', 'checks', 'rejections', 'tasks with a rejection', 'tasks cut by the limit',
-                    'check errors', 'generation errors'], rows)
+                    'tasks cut by the wall cap', 'check errors', 'generation errors'], rows)
     if rule_rows:
         out += ('\n\nWho rejected (estimated: each task\'s re-checked sample scaled to its rejections; a '
                 'pruner rejection can be listed under several rules)\n\n'

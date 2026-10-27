@@ -24,6 +24,7 @@ Typical usage:
 """
 
 import gc
+import signal
 import sys
 import time
 from pathlib import Path
@@ -54,6 +55,14 @@ from .kv_cache import RewindableCache, text_config  # noqa: E402
 
 class CheckLimitReached(Exception):
     """The task used up its check-time limit; generation stops here."""
+
+
+class WallCapReached(BaseException):
+    """The task ran past its wall-clock cap; generation stops here.
+
+    A BaseException so that no `except Exception` on the way (the checker's error guard,
+    transformers) swallows it. Raised from a SIGALRM handler, see ChopchopGenerator.generate.
+    """
 
 
 def clear_chopchop_caches(lexerspec):
@@ -95,11 +104,15 @@ class _SafeRealizabilityChecker(RealizabilityChecker):
              GPU, see tools/attribute_rejections.py. (Doing that here re-checked every
              rejected text up to four times and emptied the memo tables, which slowed the
              real checks down and so could change where a task hit its limit.)
+      - The wall-clock cap's alarm (ChopchopGenerator.generate) is held back while a check's
+        result is being recorded, so the trace and `last_accepted` always agree.
     """
 
     def __init__(self, constraint, parser, lexerspec, *, check_cpu_limit_s: Optional[float] = None):
         super().__init__(constraint, parser, lexerspec)
         self.check_cpu_limit_s = check_cpu_limit_s
+        self.recording = False         # inside the bookkeeping: hold the wall-cap alarm back
+        self.alarm_pending = False
         self.reset()
 
     def reset(self, base: str = ''):
@@ -109,8 +122,9 @@ class _SafeRealizabilityChecker(RealizabilityChecker):
         self.stats = {
             'checks': 0, 'check_cpu_s': 0.0, 'check_wall_s': 0.0, 'rejected': 0,
             'check_errors': 0, 'check_error_msg': None, 'limit_hit': False,
-            'trace': [],
+            'wall_cap_hit': False, 'trace': [],
         }
+        self.recording = self.alarm_pending = False
         self.last_accepted = None
         self._base = base
         self._t0 = time.perf_counter()
@@ -126,6 +140,7 @@ class _SafeRealizabilityChecker(RealizabilityChecker):
             st['check_errors'] += 1
             if st['check_error_msg'] is None:
                 st['check_error_msg'] = f'{type(e).__name__}: {str(e).splitlines()[0][:200] if str(e) else ""}'
+        self.recording = True
         st['check_cpu_s'] += time.thread_time() - c0
         st['check_wall_s'] += time.perf_counter() - w0
         st['checks'] += 1
@@ -142,6 +157,9 @@ class _SafeRealizabilityChecker(RealizabilityChecker):
             self.last_accepted = prefix
         else:
             st['rejected'] += 1
+        self.recording = False
+        if self.alarm_pending:
+            raise WallCapReached()
 
         if self.check_cpu_limit_s is not None and st['check_cpu_s'] >= self.check_cpu_limit_s:
             st['limit_hit'] = True
@@ -361,6 +379,10 @@ class ChopchopGenerator(BaseGenerator):
             effective_pruner, parser, lexer_spec,
             check_cpu_limit_s=kwargs.get("check_cpu_limit_s"),
         )
+        # Per-task wall-clock cap (s), a safety net next to the check-CPU limit: a task can run
+        # for hours with almost no check time, e.g. when the model tries token after token at a
+        # dead end and each is rejected in milliseconds. None = no cap.
+        self.wall_cap_s = kwargs.get("wall_cap_s")
 
         self.runner = _LocalLanguageModelRunner(ModelConfig(model_id=model_name))
 
@@ -415,22 +437,50 @@ class ChopchopGenerator(BaseGenerator):
             cfg_kwargs['timeout'] = wall_timeout
 
         run_info = None
+        wall_cap = kwargs.get("wall_cap_s", self.wall_cap_s)
+        checker = self.checker
+
+        def on_alarm(signum, frame):
+            if checker.recording:
+                checker.alarm_pending = True       # raised when the check's bookkeeping is done
+            else:
+                raise WallCapReached()
+
+        old_handler = signal.signal(signal.SIGALRM, on_alarm) if wall_cap else None
+
+        def disarm():
+            if wall_cap:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, old_handler)
+
         try:
-            run_info = self.runner.run(
-                Config(**cfg_kwargs),
-                prompt=task_prompt,
-                context=context,
-                fixed_prefix=fixed_prefix,
-                realizability_checker=self.checker,
-            )
-            output = run_info.output
-        except CheckLimitReached:
-            # Stop at the last token the checker accepted; everything up to it was checked.
+            try:
+                if wall_cap:
+                    signal.setitimer(signal.ITIMER_REAL, wall_cap)
+                run_info = self.runner.run(
+                    Config(**cfg_kwargs),
+                    prompt=task_prompt,
+                    context=context,
+                    fixed_prefix=fixed_prefix,
+                    realizability_checker=self.checker,
+                )
+                output = run_info.output
+            except CheckLimitReached:
+                # Stop at the last token the checker accepted; everything up to it was checked.
+                output = self.checker.last_accepted or fixed_prefix
+            except RecursionError:
+                disarm()
+                self.last_run_info = None
+                self.last_stats = dict(self.checker.stats, generation_error='RecursionError inside ChopChop')
+                return ""
+            finally:
+                disarm()
+        except WallCapReached:
+            # Same as the check limit: stop at the last accepted token.
+            disarm()
+            run_info = None
+            self.checker.stats['wall_cap_hit'] = True
             output = self.checker.last_accepted or fixed_prefix
-        except RecursionError:
-            self.last_run_info = None
-            self.last_stats = dict(self.checker.stats, generation_error='RecursionError inside ChopChop')
-            return ""
 
         self.last_run_info = run_info
         n_prefix = len(self.runner.tokenizer(fixed_prefix, add_special_tokens=False)['input_ids'])
@@ -438,6 +488,7 @@ class ChopchopGenerator(BaseGenerator):
             self.checker.stats,
             check_cpu_s=round(self.checker.stats['check_cpu_s'], 3),
             check_wall_s=round(self.checker.stats['check_wall_s'], 3),
+            wall_cap_s=wall_cap,
             fixed_prefix=fixed_prefix,
             llm_finished=run_info.llm_finished if run_info else False,
             wall_timed_out=run_info.timed_out if run_info else False,
