@@ -136,9 +136,10 @@ def t_controlled(runs):
     rows = []
     for (model, mode), r in sorted(runs.items()):
         s, e = r['meta']['settings'], r['meta']['env']
+        limit = (f"{s['check_cpu_limit_s']:g} s check CPU" if mode == 'chopchop'
+                 else {'itergen_off': '60 s wall', 'itergen_on': '60 s wall'}.get(mode, 'none'))
         rows.append([short(model), mode, len(r['tasks']), s['decoding'], s['max_new_tokens'], PROMPT[mode],
-                     {'chopchop': f"{s.get('check_cpu_limit_s'):g} s check CPU",
-                      'itergen_off': '60 s wall', 'itergen_on': '60 s wall'}.get(mode, 'none'),
+                     limit,
                      e.get('gpu'), e.get('cpu'), e.get('n_cpus'), e.get('torch'), e.get('transformers'),
                      e.get('repo_commit', '')[:7] + (' (dirty)' if e.get('repo_dirty') else '')])
     return md_table(['model', 'mode', 'tasks', 'decoding', 'max new tokens', 'prompt', 'time limit', 'GPU',
@@ -202,7 +203,7 @@ def t_time(runs):
         toks = [t['stats'].get('tokens') for t in ts if t['stats'].get('tokens') is not None]
         if mode.startswith('itergen'):
             chk = sum(t['stats'].get('check_s', 0) for t in ts)
-            check = f'{chk / 3600:.2f} h wall in view() + rules ({pct(chk, sum(w))} of total)'
+            check = f'{chk:.1f} s wall in view() + rules ({pct(chk, sum(w))} of total)'
         elif mode == 'chopchop':
             cpu = sum(t['stats'].get('check_cpu_s', 0) for t in ts)
             wall = sum(t['stats'].get('check_wall_s', 0) for t in ts)
