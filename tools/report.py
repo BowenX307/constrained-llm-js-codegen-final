@@ -27,6 +27,7 @@ import csv
 import json
 import math
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -221,7 +222,9 @@ def t_time(runs):
 def node_error_of(t, rule):
     cls, msg = RULE_NODE_ERROR[rule]
     e = t['eval']
-    return e['status'] == cls and (e['message_template'] or '') == msg
+    # node quotes the name in some messages but not in "flip is not defined", so match the raw message
+    pattern = '^' + re.escape(msg).replace('X', r'\S+') + '$'
+    return e['status'] == cls and bool(re.match(pattern, e['message'] or ''))
 
 
 def t_itergen(runs):
