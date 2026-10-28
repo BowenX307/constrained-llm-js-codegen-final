@@ -408,6 +408,10 @@ def queue_notebook(name, title, queue, note):
         continues where it stopped. Outputs go to the same Drive folders as
         `run_final.ipynb` (`constrained-llm-js-codegen/final/<model>/<run>`), plus a
         `queue_done.txt` in each finished run's folder.
+
+        When the queue ends, the notebook writes everything out to Drive and releases the
+        runtime by itself (`AUTO_DISCONNECT`), so it can run unattended; stopping it by hand
+        does not release it.
         """).strip('\n')))
     settings = (f"QUEUE = [\n{q},\n]\n"
                 "N_TASKS    = None                         # all 397\n"
@@ -419,12 +423,12 @@ def queue_notebook(name, title, queue, note):
                 "EXPECT_GPU = 'RTX PRO 6000'               # G4; every final run uses the same GPU type\n"
                 "REPO_URL    = 'https://github.com/BowenX307/constrained-llm-js-codegen-final.git'\n"
                 f"REPO_COMMIT = '{COMMIT}'\n"
-                f"RUN_TAG     = '{RUN_TAG}'                   # output folder suffix")
+                f"RUN_TAG     = '{RUN_TAG}'                   # output folder suffix\n"
+                "AUTO_DISCONNECT = True                    # release the runtime when the queue ends (saves compute units)")
     qcells.append(dict(cell_type='code', metadata={}, execution_count=None, outputs=[], source=settings))
     qcells.append(dict(cell_type='code', metadata={}, execution_count=None, outputs=[], source=SETUP.strip('\n')))
     body = '\n'.join(textwrap.indent(s, ' ' * 8) for s in (MS, GEN, EVAL, ATTR))
-    loop = (
-        "import traceback\n"
+    runs = (
         "for MODEL, MODE in QUEUE:\n"
         "    print('=' * 100 + f'\\n{MODEL}  {MODE}\\n' + '=' * 100, flush=True)\n"
         + textwrap.indent(PATHS.strip('\n'), ' ' * 4) + "\n"
@@ -442,6 +446,27 @@ def queue_notebook(name, title, queue, note):
         "    if DRIVE_OK:\n"
         "        open(f'{DRIVE_OUT}/queue_done.txt', 'w').write(time.strftime('%Y-%m-%d %H:%M:%S\\n'))\n"
         "print('queue finished')\n")
+    # AUTO_DISCONNECT: when the queue ends (finished or failed, but not when stopped by hand),
+    # write everything out to Drive and release the runtime, so no compute units are spent idle
+    loop = (
+        "import traceback\n"
+        "interrupted = False\n"
+        "try:\n"
+        + textwrap.indent(runs, ' ' * 4) +
+        "except KeyboardInterrupt:\n"
+        "    interrupted = True\n"
+        "    raise\n"
+        "finally:\n"
+        "    if AUTO_DISCONNECT and not interrupted:\n"
+        "        print(time.strftime('%H:%M:%S'), 'AUTO_DISCONNECT: writing to Drive, then releasing the runtime', flush=True)\n"
+        "        try:\n"
+        "            from google.colab import drive, runtime\n"
+        "            if DRIVE_OK:\n"
+        "                drive.flush_and_unmount()\n"
+        "            time.sleep(30)\n"
+        "            runtime.unassign()\n"
+        "        except Exception as e:\n"
+        "            print('could not release the runtime:', type(e).__name__, e)\n")
     qcells.append(dict(cell_type='code', metadata={}, execution_count=None, outputs=[], source=loop))
     save(os.path.join(OUT_DIR, name), qcells)
 
