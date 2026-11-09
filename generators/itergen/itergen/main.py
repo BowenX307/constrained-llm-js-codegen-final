@@ -547,6 +547,11 @@ class IterGen:
         if r.remainder_state == RemainderState.COMPLETE or r.remainder_state == RemainderState.MAYBE_COMPLETE:
             return True
 
+        # The mask store's FSMs read bytes; the parser returns the remainder as str here. Without
+        # this, no terminal matches an unfinished string and every one is judged invalid.
+        if type(r.remainder) == str:
+            r.remainder = r.remainder.encode('utf-8')
+
         # Check if the remainder is a valid prefix for the last terminal
         out = self.dfa_mask_store.is_valid_prefix(r)
         return out
