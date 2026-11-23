@@ -6,7 +6,8 @@ from transformers.generation.utils import GenerationMode
 from transformers.generation.configuration_utils import GenerationConfig
 from transformers.generation.stopping_criteria import StoppingCriteriaList
 from syncode.mask_store.mask_store import MaskStore
-from syncode.parse_result import ParseResult, RemainderState
+from syncode.parse_result import AcceptSequence, ParseResult, RemainderState
+from syncode.larkm.exceptions import UnexpectedToken
 from syncode.parsers.itergen_parser import IGParser, SymbolPosMap
 from transformers.cache_utils import DynamicCache
 from .trace import Trace
@@ -542,8 +543,8 @@ class IterGen:
             r = self.inc_parsers[idx].get_acceptable_next_terminals(partial_code, self.symbol_pos_maps[idx])
         except Exception as e:
             # self.logger.log(f"Exception while parsing:\n {e}")
-            return False
-        
+            return self._is_unfinished_regex(partial_code, e)
+
         if r.remainder_state == RemainderState.COMPLETE or r.remainder_state == RemainderState.MAYBE_COMPLETE:
             return True
 
@@ -555,6 +556,23 @@ class IterGen:
         # Check if the remainder is a valid prefix for the last terminal
         out = self.dfa_mask_store.is_valid_prefix(r)
         return out
+
+    def _is_unfinished_regex(self, partial_code: str, error: Exception) -> bool:
+        """
+        The lexer cannot tell whether a `/` starts a regex or is a division, so an unfinished
+        regex such as `/ab{2,` is lexed as SLASH IDENTIFIER LBRACE ... and the parser fails on that
+        SLASH. The code is still a valid prefix if a regex literal may appear where the SLASH is
+        and the text from the SLASH on can still grow into one. SynCode before a88b744 (the copy
+        the original IterGen bundles) skipped this case without checking anything after the `/`.
+        SLASH and REGEX_LITERAL are terminal names in generators/grammars/javascript.lark.
+        """
+        if not isinstance(error, UnexpectedToken) or error.token.type != 'SLASH':
+            return False
+        if 'REGEX_LITERAL' not in error.expected:
+            return False
+        rest = partial_code[error.token.start_pos:].encode('utf-8')
+        r = ParseResult([AcceptSequence(['REGEX_LITERAL'])], rest, RemainderState.INCOMPLETE)
+        return self.dfa_mask_store.is_valid_prefix(r)
 
     def _get_generation_mode(
         self, generation_config: GenerationConfig
