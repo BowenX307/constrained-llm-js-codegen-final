@@ -17,6 +17,9 @@ class _BraceDepthStop(StoppingCriteria):
     %ignore'd -- so the unit never fires and the whole max_new_tokens
     budget is burned on garbage that post-processing throws away (49s
     wasted on the 0.5B model, minutes on the 3B).
+
+    Braces inside strings and comments do not count (ItergenGenerator._brace_depth):
+    a plain count stopped mbpp_771 at `map.set('}',`.
     """
     def __init__(self, itergen_ref, prompt_len, depth_offset):
         self.itergen = itergen_ref
@@ -26,7 +29,7 @@ class _BraceDepthStop(StoppingCriteria):
     def __call__(self, input_ids, scores, **kwargs):
         gen = self.itergen.structured_gen[0] if self.itergen.structured_gen else ""
         body = gen[self.prompt_len:] if len(gen) > self.prompt_len else ""
-        depth = self.depth_offset + body.count('{') - body.count('}')
+        depth = self.depth_offset + ItergenGenerator._brace_depth(body)
         stop = depth <= 0
         return torch.full((input_ids.shape[0],), stop, dtype=torch.bool, device=input_ids.device)
 
@@ -239,7 +242,7 @@ class ItergenGenerator(BaseGenerator):
             # there and IterGen allows comments anywhere via %ignore.
             if stop_tokens and generated_so_far:
                 should_stop = False
-                gen_depth = prompt_brace_depth + generated_so_far.count('{') - generated_so_far.count('}')
+                gen_depth = prompt_brace_depth + self._brace_depth(generated_so_far)
                 for stop in stop_tokens:
                     if stop in generated_so_far:
                         if stop in ('\n//', '\n/*') and gen_depth > 0:
@@ -250,11 +253,11 @@ class ItergenGenerator(BaseGenerator):
                     self.stats['stop_reason'] = 'stop_token'
                     break
 
-            # Check 2: Brace depth — if the function body is complete (all braces balanced), stop
+            # Check 2: Brace depth — if the function body is complete (all braces balanced), stop.
+            # Braces inside strings and comments do not count, the same rule as the fallback
+            # check below; a plain count stopped mbpp_771 at `map.set('}',`.
             if generated_so_far and prompt_brace_depth > 0:
-                gen_open = generated_so_far.count('{')
-                gen_close = generated_so_far.count('}')
-                current_depth = prompt_brace_depth + gen_open - gen_close
+                current_depth = prompt_brace_depth + self._brace_depth(generated_so_far)
                 if current_depth <= 0:
                     self.stats['stop_reason'] = 'function_closed'
                     break
@@ -364,7 +367,7 @@ class ItergenGenerator(BaseGenerator):
             if idx == -1:
                 continue
             if stop in ('\n//', '\n/*'):
-                depth = prompt_brace_depth + text[:idx].count('{') - text[:idx].count('}')
+                depth = prompt_brace_depth + self._brace_depth(text[:idx])
                 if depth > 0:
                     continue
             min_stop_index = min(min_stop_index, idx)
