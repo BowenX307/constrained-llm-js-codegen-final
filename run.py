@@ -11,6 +11,8 @@ modes:
   unconstrained   plain greedy decoding (raw prompt)
   itergen_off     IterGen, grammar only (raw prompt)
   itergen_on      IterGen + the semantic checks in generators/semantic_checks.py (raw prompt)
+  itergen_on_repair  itergen_on, but a helper the code calls without defining it is written
+                  into the function at the end instead of being backtracked (repair_helpers)
   chopchop        ChopChop + the "basic" JS pruner (chat template + rewritten prompt, as
                   the ChopChop integration was designed)
 
@@ -33,7 +35,7 @@ sys.path.insert(0, REPO)
 DATASET = os.path.join(REPO, 'datasets', 'js_prompts_mbpp.jsonl')
 ITERGEN_GRAMMAR = os.path.join(REPO, 'generators', 'grammars', 'javascript.lark')
 CHOPCHOP_GRAMMAR = os.path.join(REPO, 'generators', 'grammars', 'javascript_chopchop.lark')
-MODES = ('unconstrained', 'itergen_off', 'itergen_on', 'chopchop')
+MODES = ('unconstrained', 'itergen_off', 'itergen_on', 'itergen_on_repair', 'chopchop')
 
 
 def parse_args():
@@ -113,7 +115,8 @@ def generate(gen, mode, task, max_new_tokens):
         return out, dict(gen.last_stats)
     if mode.startswith('itergen'):
         out = gen.generate(task['prompt'], stops, temperature=0.0, max_new_tokens=max_new_tokens,
-                           semantic_checks=(mode == 'itergen_on'))
+                           semantic_checks=(mode in ('itergen_on', 'itergen_on_repair')),
+                           repair_helpers=(mode == 'itergen_on_repair'))
         return out, dict(gen.stats, violations=list(gen.violations))
     out = gen.generate(task['prompt'], stop_tokens=stops, temperature=0.0, max_new_tokens=max_new_tokens)
     return out, dict(gen.last_stats or {})

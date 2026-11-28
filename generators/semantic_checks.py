@@ -224,6 +224,80 @@ def rule_undeclared(ctx: StepContext) -> Optional[str]:
     return None
 
 
+# --- Helper repair (ItergenGenerator, repair_helpers=True) ---------------------------------
+# A model often calls a helper (`if(isPrime(i))`) that it means to define after the
+# function. MultiPL-E's stop token '\nfunction ' cuts that definition, and backing out the
+# call only makes the model rewrite correct code. With repair_helpers, an undeclared name
+# that is CALLED is not a violation; the generator asks the model for the helper as a
+# nested function declaration once the function is finished (JS hoists those).
+
+# Words that can stand right before `(` without being a call.
+_NOT_CALLS = frozenset(["if", "for", "while", "switch", "catch", "function", "return",
+                        "typeof", "new", "do", "else", "await", "yield", "void", "delete",
+                        "in", "of", "instanceof", "case", "throw", "with"])
+
+
+def is_called(name: str, text: str) -> bool:
+    """`name(` occurs in `text` as a plain call (not `.name(`)."""
+    return re.search(r'(?<![a-zA-Z0-9_$.])' + re.escape(name) + r'\s*\(', text) is not None
+
+
+def undeclared_names(ctx: StepContext) -> List[str]:
+    """Every name rule_undeclared would report for this step, in order (it reports the first)."""
+    names = []
+    for prim_str in ctx.new["primary_safe_non_numeric"]:
+        token = prim_str.strip()
+        if not (re.match(r'^[a-zA-Z_$][a-zA-Z0-9_$]*$', token) and token not in ctx.identifiers):
+            continue
+        if not re.search(r'(?<![a-zA-Z0-9_$])' + re.escape(token) + r'(?![a-zA-Z0-9_$])', ctx.full_text):
+            continue
+        if token not in names:
+            names.append(token)
+    return names
+
+
+def undeclared_calls(ctx: StepContext) -> List[str]:
+    """The names of undeclared_names(ctx) that the generated code calls as functions."""
+    body = ctx.full_text[ctx.body_start:]
+    return [n for n in undeclared_names(ctx) if n not in _NOT_CALLS and is_called(n, body)]
+
+
+def rule_undeclared_variable(ctx: StepContext) -> Optional[str]:
+    """rule_undeclared, except for names the code calls (those are left to the helper repair)."""
+    body = ctx.full_text[ctx.body_start:]
+    for token in undeclared_names(ctx):
+        if token in _NOT_CALLS or not is_called(token, body):
+            return f"Undeclared: '{token}'"
+    return None
+
+
+def helper_missing(name: str, body: str, known: Set[str] = frozenset()) -> bool:
+    """`name` is called in `body` and nothing there (or in `known`) defines it.
+
+    Strict on purpose, because a nested `function name` would shadow anything else of that
+    name: every standalone occurrence must be a call, so a parameter, a variable, a callback
+    argument or a property of the same name rules it out.
+    """
+    if name in BASE_IDENTIFIERS or name in _NOT_CALLS or name in known:
+        return False
+    if re.search(r'\bfunction\s+' + re.escape(name) + r'\s*\(', body):
+        return False
+    uses = list(re.finditer(r'(?<![a-zA-Z0-9_$])' + re.escape(name) + r'(?![a-zA-Z0-9_$])', body))
+    if not uses:
+        return False
+    return all(re.match(r'\s*\(', body[m.end():]) and body[m.start() - 1:m.start()] != '.'
+               for m in uses)
+
+
+def called_names(text: str) -> List[str]:
+    """Plain names called in `text`, in order (candidates for a further helper)."""
+    names = []
+    for m in re.finditer(r'(?<![a-zA-Z0-9_$.])([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(', text):
+        if m.group(1) not in names:
+            names.append(m.group(1))
+    return names
+
+
 _ASSIGNMENT_OPS = sorted(["=", "+=", "-=", "*=", "/=", "%=", "**=", ">>=", "<<=", ">>>=", "&=",
                           "^=", "&&=", "||=", "??="], key=len, reverse=True)
 _OPS_PATTERN = '|'.join(map(re.escape, _ASSIGNMENT_OPS))
@@ -392,6 +466,7 @@ def rule_orphan_break(ctx: StepContext) -> Optional[str]:
 RULES = {
     "redeclaration": rule_redeclaration,
     "undeclared": rule_undeclared,
+    "undeclared_variable": rule_undeclared_variable,   # used instead of undeclared by repair_helpers
     "const_reassign": rule_const_reassign,
     "orphan_break": rule_orphan_break,
 }

@@ -1,7 +1,7 @@
 import re
 import time
 import torch
-from transformers import StoppingCriteria
+from transformers import StoppingCriteria, StoppingCriteriaList
 from .itergen.itergen.main import IterGen
 from .base import BaseGenerator
 from . import semantic_checks
@@ -32,6 +32,19 @@ class _BraceDepthStop(StoppingCriteria):
         depth = self.depth_offset + ItergenGenerator._brace_depth(body)
         stop = depth <= 0
         return torch.full((input_ids.shape[0],), stop, dtype=torch.bool, device=input_ids.device)
+
+class _HelperClosedStop(StoppingCriteria):
+    """Stop the generation of a helper (see ItergenGenerator._add_helpers) once the brace
+    that opens its body is closed. Braces inside strings and comments do not count."""
+    def __init__(self, tokenizer, input_len):
+        self.tokenizer = tokenizer
+        self.input_len = input_len
+
+    def __call__(self, input_ids, scores, **kwargs):
+        tail = self.tokenizer.decode(input_ids[0][self.input_len:], skip_special_tokens=True)
+        done = '{' in tail and ItergenGenerator._brace_depth(tail) <= 0
+        return torch.full((input_ids.shape[0],), done, dtype=torch.bool, device=input_ids.device)
+
 
 class ItergenGenerator(BaseGenerator):
     def __init__(self, model_name: str, grammar: str, **kwargs):
@@ -100,6 +113,11 @@ class ItergenGenerator(BaseGenerator):
             'mask_empty': 0,
             'reprefills': 0,           # hybrid-cache rewinds (see kv_cache.py)
             'tokens': None,            # tokens IterGen generated (its own counter)
+            # repair_helpers only (see _add_helpers):
+            'helpers_deferred': [],    # called but undeclared names that were not backtracked
+            'helpers_added': [],       # helpers written into the function
+            'helpers_dropped': [],     # [name, why] for helpers that were tried and not kept
+            'helper_s': 0.0,
         }
 
     def generate(self, prompt: str, stop_tokens, **kwargs) -> str:
@@ -153,6 +171,16 @@ class ItergenGenerator(BaseGenerator):
         tracking_categories = list(semantic_checks.TRACKED_CATEGORIES) if enable_semantic_checks else []
         # Which rules to run, in order; the first one that fires wins.
         semantic_rules = tuple(kwargs.get("semantic_rules", semantic_checks.DEFAULT_RULES))
+        # repair_helpers (mode itergen_on_repair): a name the code CALLS without declaring
+        # it is not a violation. The model usually means to define it after the function,
+        # where the stop token cuts it, so backing out the call only makes it rewrite
+        # correct code. The helper is asked for once the function is finished (_add_helpers).
+        # Every other violation, including an undeclared variable, backtracks as before.
+        repair_helpers = enable_semantic_checks and bool(kwargs.get("repair_helpers", False))
+        if repair_helpers:
+            semantic_rules = tuple("undeclared_variable" if r == "undeclared" else r
+                                   for r in semantic_rules)
+        pending_helpers = []
         # One record per backtrack: which rule fired and why. Read it after generate()
         # to attribute what the checks did to individual rules.
         self.violations = []
@@ -280,6 +308,11 @@ class ItergenGenerator(BaseGenerator):
             post_positions = {cat: list(spm.get_symbol_pos_all(cat)) for cat in tracking_categories}
             ctx = semantic_checks.build_context(generated_so_far, full_gen_so_far, post_items,
                                                 pre_counts, base_identifiers, post_positions)
+            if repair_helpers:
+                for name in semantic_checks.undeclared_calls(ctx):
+                    if name not in pending_helpers:
+                        pending_helpers.append(name)
+                        self.stats['helpers_deferred'].append(name)
             violation = semantic_checks.first_violation(ctx, semantic_rules)
             self.stats['check_s'] += time.perf_counter() - t_check
             is_valid = violation is None
@@ -342,6 +375,12 @@ class ItergenGenerator(BaseGenerator):
             )
             self.stats['fallback_text'] = (full_text[len(before_fallback):]
                                            if full_text.startswith(before_fallback) else full_text)
+
+        if repair_helpers and pending_helpers and full_text.startswith(prompt):
+            t_helper = time.perf_counter()
+            full_text = self._add_helpers(full_text, prompt, pending_helpers, base_identifiers,
+                                          prompt_brace_depth, temp)
+            self.stats['helper_s'] = round(time.perf_counter() - t_helper, 3)
 
         generated_only = ""
         if full_text.startswith(prompt):
@@ -413,6 +452,92 @@ class ItergenGenerator(BaseGenerator):
             return prompt + self._post_process_stop(trimmed, stop_tokens, prompt_brace_depth)
 
         return completed
+
+    MAX_HELPERS = 3             # helpers tried per task, including helpers of helpers
+    HELPER_MAX_NEW_TOKENS = 256
+
+    def _add_helpers(self, full_text: str, prompt: str, pending, known, prompt_brace_depth: int,
+                     temperature: float) -> str:
+        """Write each called but undefined helper into the finished function.
+
+        The text before the function's closing brace gets `function NAME(` on a new line,
+        the model writes the rest of the helper (no constraints, as in the fallback), and
+        the brace goes back after it:
+
+            function count_Primes_nums(n){        function count_Primes_nums(n){
+                ...isPrime(i)...           ->         ...isPrime(i)...
+                return count;                         return count;
+            }                                         function isPrime(x){ ... }
+                                                  }
+
+        JavaScript hoists function declarations, so the earlier calls work, and nothing is
+        written after the function, which the benchmark's stop tokens would cut. A helper
+        is kept only if its body closes within HELPER_MAX_NEW_TOKENS and it parses on its
+        own; otherwise the text stays as it was. Helpers that a new helper calls are
+        tried too, up to MAX_HELPERS in all.
+        """
+        todo, tried = list(pending), 0
+        while todo and tried < self.MAX_HELPERS:
+            name = todo.pop(0)
+            body = full_text[len(prompt):]
+            if not semantic_checks.helper_missing(name, body, known):
+                continue                       # defined after all, or no longer called
+            trimmed = self._trim_at_balanced_brace(body, prompt_brace_depth)
+            if prompt_brace_depth + self._brace_depth(trimmed) > 0:
+                self.stats['helpers_dropped'].append([name, 'function not closed'])
+                break
+            tried += 1
+            close = len(prompt) + len(trimmed) - 1          # the function's closing brace
+            indent = re.match(r'[ \t]*', body).group(0) or '    '
+            head = full_text[:close].rstrip(' \t')
+            if not head.endswith('\n'):
+                head += '\n'
+            stub = f'{indent}function {name}('
+            tail = self._generate_helper(head + stub, temperature)
+            if tail is None:
+                self.stats['helpers_dropped'].append([name, 'not closed'])
+                continue
+            helper = stub + tail
+            if not self._parses(prompt + helper + '\n}\n'):
+                self.stats['helpers_dropped'].append([name, 'does not parse'])
+                continue
+            full_text = head + helper + '\n' + full_text[close:]
+            self.stats['helpers_added'].append(name)
+            new_body = full_text[len(prompt):]
+            for callee in semantic_checks.called_names(helper[len(stub):]):
+                if callee != name and callee not in todo and callee not in self.stats['helpers_added'] \
+                        and semantic_checks.helper_missing(callee, new_body, known):
+                    todo.append(callee)
+        return full_text
+
+    def _generate_helper(self, text: str, temperature: float):
+        """The model's continuation of `text` up to the brace that closes the helper's body,
+        or None if it does not close within HELPER_MAX_NEW_TOKENS."""
+        tokenizer, model = self.itergen.tokenizer, self.itergen.model
+        inputs = tokenizer([text], return_tensors="pt").to(self.itergen.device)
+        input_len = inputs["input_ids"].shape[-1]
+        gen_kwargs = {"max_new_tokens": self.HELPER_MAX_NEW_TOKENS, "do_sample": temperature > 0,
+                      "pad_token_id": tokenizer.eos_token_id,
+                      "stopping_criteria": StoppingCriteriaList([_HelperClosedStop(tokenizer, input_len)])}
+        if temperature > 0:
+            gen_kwargs["temperature"] = temperature
+        with torch.no_grad():
+            outputs = model.generate(**inputs, **gen_kwargs)
+        tail = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
+        tail = self._trim_at_balanced_brace(tail, 0)
+        if '{' not in tail or self._brace_depth(tail) != 0 or not tail.rstrip().endswith('}'):
+            return None
+        return tail
+
+    def _parses(self, text: str) -> bool:
+        """`text` parses with IterGen's grammar (its parser is free once generation is over)."""
+        ip = self.itergen.inc_parsers[0]
+        try:
+            ip.reset()
+            ip.get_acceptable_next_terminals(text, type(self.itergen.symbol_pos_maps[0])())
+            return True
+        except Exception:
+            return False
 
     def _trim_at_balanced_brace(self, text: str, prompt_brace_depth: int) -> str:
         depth = prompt_brace_depth
