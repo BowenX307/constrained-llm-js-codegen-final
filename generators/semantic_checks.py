@@ -271,6 +271,33 @@ def rule_undeclared_variable(ctx: StepContext) -> Optional[str]:
     return None
 
 
+def _code_only(text: str) -> str:
+    """`text` with the contents of comments and string literals blanked out (same length),
+    so that a name mentioned in a comment or a string is not taken for a use."""
+    out, i, n = list(text), 0, len(text)
+    while i < n:
+        two = text[i:i + 2]
+        if two == '//':
+            j = text.find('\n', i)
+            j = n if j == -1 else j
+        elif two == '/*':
+            j = text.find('*/', i + 2)
+            j = n if j == -1 else j + 2
+        elif text[i] in '\'"`':
+            j = i + 1
+            while j < n and text[j] != text[i]:
+                j += 2 if text[j] == '\\' else 1
+            j = min(j + 1, n)
+        else:
+            i += 1
+            continue
+        for k in range(i, j):
+            if out[k] != '\n':
+                out[k] = ' '
+        i = j
+    return ''.join(out)
+
+
 def helper_missing(name: str, body: str, known: Set[str] = frozenset()) -> bool:
     """`name` is called in `body` and nothing there (or in `known`) defines it.
 
@@ -280,6 +307,7 @@ def helper_missing(name: str, body: str, known: Set[str] = frozenset()) -> bool:
     """
     if name in BASE_IDENTIFIERS or name in _NOT_CALLS or name in known:
         return False
+    body = _code_only(body)        # `// call heapify on the heap` is not a use (mbpp_635)
     if re.search(r'\bfunction\s+' + re.escape(name) + r'\s*\(', body):
         return False
     uses = list(re.finditer(r'(?<![a-zA-Z0-9_$])' + re.escape(name) + r'(?![a-zA-Z0-9_$])', body))
@@ -292,7 +320,7 @@ def helper_missing(name: str, body: str, known: Set[str] = frozenset()) -> bool:
 def called_names(text: str) -> List[str]:
     """Plain names called in `text`, in order (candidates for a further helper)."""
     names = []
-    for m in re.finditer(r'(?<![a-zA-Z0-9_$.])([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(', text):
+    for m in re.finditer(r'(?<![a-zA-Z0-9_$.])([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(', _code_only(text)):
         if m.group(1) not in names:
             names.append(m.group(1))
     return names
